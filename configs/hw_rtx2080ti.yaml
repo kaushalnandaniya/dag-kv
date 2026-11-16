@@ -1,0 +1,48 @@
+# Hardware & Kernel Configuration for 2x NVIDIA GeForce RTX 2080 Ti (sm_75 Turing)
+
+hardware:
+  target_arch: "sm_75"
+  device_name: "NVIDIA GeForce RTX 2080 Ti"
+  vram_per_gpu_gb: 11.0
+  num_gpus: 2
+  sm_count: 68
+  sram_per_sm_bytes: 65536  # 64 KB shared memory per SM
+  memory_bandwidth_gbps: 616.0
+
+precision:
+  enforce_fp16: true
+  allow_bf16: false        # STRICT BAN: Turing sm_75 lacks native bfloat16 tensor core instructions
+  storage_dtype: "float16"
+  accumulator_dtype: "float32"
+
+triton_sm75_tiles:
+  paged_attn:
+    block_m: 32            # Tile size for queries
+    block_n: 16            # Tile size for key/value blocks (ensures shared memory < 64KB)
+    num_stages: 2          # Strict double buffering for sm_75
+    num_warps: 4
+  sparse_stitch:
+    block_m: 32
+    block_n: 32
+    num_stages: 2
+    num_warps: 4
+
+dag_kv:
+  sink_prefix: "<|im_start|>system\n"
+  num_sink_tokens: 4
+  block_size: 16           # Tokens per paged KV block
+  bridge_token_top_k: 0.08 # Top 8% LSE perturbation bridge tokens
+  lse_probe_layer: 1       # Layer 1 LSE probe
+  max_num_blocks: 8192     # Pool size per GPU
+  
+devices:
+  mode_a:
+    inference_device: "cuda:0"
+    prefill_device: "cuda:1"
+  mode_b:
+    tp_size: 2
+    devices: ["cuda:0", "cuda:1"]
+
+models:
+  primary: "Qwen/Qwen2.5-3B-Instruct"
+  scale_up: "Qwen/Qwen2.5-7B-Instruct"
