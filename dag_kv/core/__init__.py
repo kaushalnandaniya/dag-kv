@@ -22,6 +22,9 @@ from .block_manager import (
     LogicalBlock,
     PhysicalBlock,
 )
+from .quantizer import (
+    KVQuantizer,
+)
 
 __all__ = [
     "apply_rope_half",
@@ -38,4 +41,5 @@ __all__ = [
     "OffsetBlockTable",
     "LogicalBlock",
     "PhysicalBlock",
+    "KVQuantizer",
 ]

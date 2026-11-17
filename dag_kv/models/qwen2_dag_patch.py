@@ -8,12 +8,15 @@ from transformers.models.qwen2.modeling_qwen2 import rotate_half, apply_rotary_p
 
 from dag_kv.core.block_manager import BlockManager, OffsetBlockTable
 from dag_kv.core.lse_probe import LSEProbe, compute_lse_perturbation, select_bridge_tokens
+from dag_kv.core.rope_adjoint import compute_inv_freq
 from dag_kv.core.sink_canonicalizer import CanonicalChunk, SinkCanonicalizer
-from dag_kv.kernels.triton_adjoint_paged_attn import (
-    triton_adjoint_paged_attention,
-    _GLOBAL_COS_SIN_CACHE,
+from dag_kv.devices.device_manager import get_device_manager
+from dag_kv.devices.shard_config import ShardConfig, QuantizationMode
+from dag_kv.kernels.dispatch import (
+    adjoint_paged_attention,
+    sparse_bridge_attention,
 )
-from dag_kv.kernels.triton_sparse_stitch import triton_sparse_bridge_attention
+from dag_kv.kernels.triton_adjoint_paged_attn import _GLOBAL_COS_SIN_CACHE
 
 
 class Qwen2DAGKVEngine:
@@ -25,14 +28,35 @@ class Qwen2DAGKVEngine:
         tokenizer: PreTrainedTokenizer,
         max_num_blocks: int = 2048,
         block_size: int = 16,
-        device: Union[str, torch.device] = "cuda:0",
+        device: Optional[Union[str, torch.device]] = None,
         bridge_top_k: float = 0.08,
+        dtype: Optional[torch.dtype] = None,
+        quantization: str = "none",
+        shard_config: Optional[ShardConfig] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = torch.device(device)
-        self.bridge_top_k = bridge_top_k
-        self.block_size = block_size
+        self.shard_config = shard_config
+
+        if shard_config is not None:
+            self.device = shard_config.device
+            self.block_size = shard_config.block_size
+            self.bridge_top_k = shard_config.bridge_top_k
+            self.dtype = shard_config.dtype
+            self.quantization = shard_config.quantization.value if hasattr(shard_config.quantization, "value") else str(shard_config.quantization)
+            max_num_blocks = shard_config.max_num_blocks
+        else:
+            if device is not None:
+                self.device = torch.device(device)
+            else:
+                self.device = get_device_manager().primary_device
+            self.block_size = block_size
+            self.bridge_top_k = bridge_top_k
+            self.quantization = quantization
+            if dtype is not None:
+                self.dtype = dtype
+            else:
+                self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
 
         self.config = model.config
         self.num_layers = self.config.num_hidden_layers
@@ -40,15 +64,23 @@ class Qwen2DAGKVEngine:
         self.num_kv_heads = self.config.num_key_value_heads
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.num_heads)
         self.sm_scale = 1.0 / math.sqrt(self.head_dim)
-        self.dtype = torch.float16
 
-        self.inv_freq = self.model.model.rotary_emb.inv_freq.to(self.device)
         self.rope_base = getattr(self.config, "rope_theta", 1000000.0) or 1000000.0
+        if hasattr(self.model.model, "rotary_emb") and hasattr(self.model.model.rotary_emb, "inv_freq"):
+            self.inv_freq = self.model.model.rotary_emb.inv_freq.to(self.device)
+        else:
+            self.inv_freq = compute_inv_freq(self.head_dim, base=self.rope_base, device=self.device)
         self._init_rope_cache()
+
+        vocab_size = getattr(self.config, "vocab_size", 160000)
+        sink_token_ids = None
+        if vocab_size <= 151644:
+            sink_token_ids = [min(i, vocab_size - 1) for i in range(4)]
 
         self.canonicalizer = SinkCanonicalizer(
             sink_prefix="<|im_start|>system\n",
             num_sink_tokens=4,
+            sink_token_ids=sink_token_ids,
         )
 
         self.block_manager = BlockManager(
@@ -56,9 +88,10 @@ class Qwen2DAGKVEngine:
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             max_num_blocks=max_num_blocks,
-            block_size=block_size,
+            block_size=self.block_size,
             device=self.device,
             dtype=self.dtype,
+            quantization=self.quantization,
         )
 
         self.lse_probe = LSEProbe(top_k_percent=self.bridge_top_k, probe_layer=1)
@@ -350,12 +383,25 @@ class Qwen2DAGKVEngine:
             q_rot = (q * cos_q) + (rotate_half(q) * sin_q)
             k_rot = (k * cos_k) + (rotate_half(k) * sin_k)
 
-            # Single vectorized GPU scatter into CoW Shadow Blocks
-            self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = k_rot.transpose(0, 1)
-            self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = v.transpose(0, 1)
+            # Vectorized scatter into CoW Shadow Blocks
+            if self.block_manager.quantization == "int8":
+                from dag_kv.core.quantizer import KVQuantizer
+                k_q, k_sc = KVQuantizer.quantize_int8(k_rot.transpose(0, 1), dim=-1)
+                v_q, v_sc = KVQuantizer.quantize_int8(v.transpose(0, 1), dim=-1)
+                self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = k_q
+                self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = v_q
+                self.block_manager.k_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = k_sc
+                self.block_manager.v_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = v_sc
+                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
+                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
+            else:
+                self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = k_rot.transpose(0, 1)
+                self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = v.transpose(0, 1)
+                k_scales_l = None
+                v_scales_l = None
 
-            # Hardware Triton Ragged Micro-Prefill Kernel
-            out_b = triton_sparse_bridge_attention(
+            # Universal Sparse Stitch Kernel (Triton on CUDA, PyTorch on CPU/MPS/INT8)
+            out_b = sparse_bridge_attention(
                 q_bridge=q_rot.unsqueeze(0),
                 bridge_positions=bridge_pos_2d,
                 k_pool=self.block_manager.k_pool[:, l_idx],
@@ -366,6 +412,8 @@ class Qwen2DAGKVEngine:
                 base=self.rope_base,
                 block_start_tables=block_starts_2d,
                 valid_lens_tables=valid_lens_2d,
+                k_scales=k_scales_l,
+                v_scales=v_scales_l,
             )
 
             out_b = out_b.squeeze(0).transpose(0, 1).reshape(n_b, -1)
@@ -428,10 +476,23 @@ class Qwen2DAGKVEngine:
 
             q_rot, k_rot = apply_rotary_pos_emb(q, k, cos_n, sin_n)
 
-            self.block_manager.k_pool[phys_blk, layer_idx, :, blk_offset, :] = k_rot.squeeze(0).squeeze(1)
-            self.block_manager.v_pool[phys_blk, layer_idx, :, blk_offset, :] = v.squeeze(0).squeeze(1)
+            if self.block_manager.quantization == "int8":
+                from dag_kv.core.quantizer import KVQuantizer
+                k_q, k_sc = KVQuantizer.quantize_int8(k_rot.squeeze(0).squeeze(1), dim=-1)
+                v_q, v_sc = KVQuantizer.quantize_int8(v.squeeze(0).squeeze(1), dim=-1)
+                self.block_manager.k_pool[phys_blk, layer_idx, :, blk_offset, :] = k_q
+                self.block_manager.v_pool[phys_blk, layer_idx, :, blk_offset, :] = v_q
+                self.block_manager.k_scale_pool[phys_blk, layer_idx, :, blk_offset, :] = k_sc
+                self.block_manager.v_scale_pool[phys_blk, layer_idx, :, blk_offset, :] = v_sc
+                k_scales_l = self.block_manager.k_scale_pool[:, layer_idx]
+                v_scales_l = self.block_manager.v_scale_pool[:, layer_idx]
+            else:
+                self.block_manager.k_pool[phys_blk, layer_idx, :, blk_offset, :] = k_rot.squeeze(0).squeeze(1)
+                self.block_manager.v_pool[phys_blk, layer_idx, :, blk_offset, :] = v.squeeze(0).squeeze(1)
+                k_scales_l = None
+                v_scales_l = None
 
-            attn_out = triton_adjoint_paged_attention(
+            attn_out = adjoint_paged_attention(
                 q=q_rot,
                 k_pool=self.block_manager.k_pool[:, layer_idx],
                 v_pool=self.block_manager.v_pool[:, layer_idx],
@@ -442,6 +503,8 @@ class Qwen2DAGKVEngine:
                 base=self.rope_base,
                 block_start_tables=block_starts_2d,
                 valid_lens_tables=valid_lens_2d,
+                k_scales=k_scales_l,
+                v_scales=v_scales_l,
             )
 
             attn_out = attn_out.transpose(1, 2).reshape(1, 1, -1)

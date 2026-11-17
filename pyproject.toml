@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dag-kv"
-version = "0.1.0"
-description = "Position-Decoupled Graph KV Cache with Query-Side Adjoint RoPE & LSE-Bounded Sparse Bridge Repair"
+version = "0.2.0"
+description = "Universal Position-Decoupled Graph KV Cache with Query-Side Adjoint RoPE & LSE-Bounded Sparse Bridge Repair"
 authors = [{ name = "Kaushal Nandaniya" }]
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,7 +24,17 @@ dev = [
     "pytest>=8.0.0",
     "pytest-cov"
 ]
+vllm = [
+    "vllm>=0.6.0"
+]
+
+[project.scripts]
+dag-kv = "dag_kv.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dag_kv*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,16 +1,19 @@
-"""Paged Block Manager, Content-SHA256 Registry & CoW Shadow Blocks.
+"""Paged Block Manager, Content-SHA256 Registry & Adaptive Memory Pools.
 
-Manages physical KV cache memory on GPU:
-1. Physical memory pool allocated upfront in HBM (FP16).
+Manages physical KV cache memory across hardware platforms:
+1. Physical memory pool allocated upfront across CUDA, Apple Silicon MPS, or Host RAM (CPU).
 2. Content-addressable SHA256 storage for canonical chunks.
 3. Logical-to-Physical OffsetBlockTable mapping with per-block RoPE Delta.
-4. Copy-on-Write (CoW) Shadow Blocks for request-private Bridge Token updates,
-   ensuring canonical blocks remain 100% read-only and shareable across requests.
+4. Copy-on-Write (CoW) Shadow Blocks for request-private Bridge Token updates.
+5. Dynamic Block Sizes (8, 16, 32, 64) and Runtime Quantization (FP16, INT8, INT4).
+6. Pinned Host Memory for CPU-Offloaded KV Pooling.
 """
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Union
 import torch
+
+from .quantizer import KVQuantizer
 from .sink_canonicalizer import CanonicalChunk
 
 
@@ -41,15 +44,22 @@ class OffsetBlockTable:
         self.block_size = block_size
         self.blocks: List[LogicalBlock] = []
 
-    def append_block(self, physical_idx: int, delta: int, is_cow_shadow: bool = False, valid_tokens: int = 16):
+    def append_block(
+        self,
+        physical_idx: int,
+        delta: int,
+        is_cow_shadow: bool = False,
+        valid_tokens: Optional[int] = None,
+    ):
         logical_idx = len(self.blocks)
+        v_tokens = self.block_size if valid_tokens is None else valid_tokens
         self.blocks.append(
             LogicalBlock(
                 logical_idx=logical_idx,
                 physical_idx=physical_idx,
                 delta=delta,
                 is_cow_shadow=is_cow_shadow,
-                valid_tokens=valid_tokens,
+                valid_tokens=v_tokens,
             )
         )
 
@@ -62,7 +72,7 @@ class OffsetBlockTable:
         return torch.tensor([b.delta for b in self.blocks], dtype=torch.int32, device=device)
 
     def get_valid_tokens(self, device: Optional[torch.device] = None) -> torch.Tensor:
-        """Returns 1D tensor of valid token counts (1..16) per logical block."""
+        """Returns 1D tensor of valid token counts per logical block."""
         return torch.tensor([b.valid_tokens for b in self.blocks], dtype=torch.int32, device=device)
 
     def get_block_starts(self, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -106,7 +116,9 @@ class BlockManager:
         max_num_blocks: int = 4096,
         block_size: int = 16,
         device: Union[str, torch.device] = "cuda:0",
-        dtype: torch.dtype = torch.float16,
+        dtype: Optional[torch.dtype] = None,
+        quantization: str = "none",
+        pin_memory: bool = False,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -114,23 +126,42 @@ class BlockManager:
         self.max_num_blocks = max_num_blocks
         self.block_size = block_size
         self.device = torch.device(device)
-        self.dtype = dtype
+        self.quantization = quantization.lower()
+        self.pin_memory = pin_memory
 
-        # Enforce FP16 constraint for Turing sm_75
-        assert self.dtype == torch.float16, "Hardware constraint sm_75: Memory pool must be float16"
+        # Determine optimal computation and storage dtype
+        if dtype is not None:
+            self.dtype = dtype
+        else:
+            if self.device.type == "cuda":
+                self.dtype = torch.float16
+            elif self.device.type == "mps":
+                self.dtype = torch.float32
+            else:
+                self.dtype = torch.float32
 
-        # Allocate physical memory pool in HBM:
+        self.storage_dtype = torch.int8 if self.quantization == "int8" else self.dtype
+
+        # Allocate physical memory pool
         # Shape: (max_num_blocks, num_layers, num_kv_heads, block_size, head_dim)
-        self.k_pool = torch.zeros(
-            (max_num_blocks, num_layers, num_kv_heads, block_size, head_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.v_pool = torch.zeros(
-            (max_num_blocks, num_layers, num_kv_heads, block_size, head_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        pool_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, head_dim)
+
+        if self.device.type == "cpu" and self.pin_memory and torch.cuda.is_available():
+            self.k_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device="cpu").pin_memory()
+            self.v_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device="cpu").pin_memory()
+        else:
+            self.k_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device=self.device)
+            self.v_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device=self.device)
+
+        # Quantization scale pools for INT8
+        if self.quantization == "int8":
+            scale_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, 1)
+            scale_dtype = torch.float32 if self.device.type == "cpu" else torch.float16
+            self.k_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)
+            self.v_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)
+        else:
+            self.k_scale_pool = None
+            self.v_scale_pool = None
 
         # Free list & metadata tracking
         self.free_blocks: List[int] = list(range(max_num_blocks))
@@ -181,6 +212,16 @@ class BlockManager:
         k_cache = chunk.k_cache.to(self.device, dtype=self.dtype)
         v_cache = chunk.v_cache.to(self.device, dtype=self.dtype)
 
+        # Handle INT8 quantization during chunk registration
+        if self.quantization == "int8":
+            k_storage, k_scale = KVQuantizer.quantize_int8(k_cache, dim=-1)
+            v_storage, v_scale = KVQuantizer.quantize_int8(v_cache, dim=-1)
+        else:
+            k_storage = k_cache
+            v_storage = v_cache
+            k_scale = None
+            v_scale = None
+
         for b_idx in range(num_blocks):
             start = b_idx * self.block_size
             end = min(start + self.block_size, length)
@@ -191,8 +232,12 @@ class BlockManager:
 
             # Copy slice into physical block pool:
             # k_cache is (num_layers, num_kv_heads, L_c, head_dim)
-            self.k_pool[phys_id, :, :, :block_len, :] = k_cache[:, :, start:end, :]
-            self.v_pool[phys_id, :, :, :block_len, :] = v_cache[:, :, start:end, :]
+            self.k_pool[phys_id, :, :, :block_len, :] = k_storage[:, :, start:end, :]
+            self.v_pool[phys_id, :, :, :block_len, :] = v_storage[:, :, start:end, :]
+
+            if self.quantization == "int8" and k_scale is not None and v_scale is not None:
+                self.k_scale_pool[phys_id, :, :, :block_len, :] = k_scale[:, :, start:end, :]
+                self.v_scale_pool[phys_id, :, :, :block_len, :] = v_scale[:, :, start:end, :]
 
         self.canonical_registry[chunk.chunk_id] = allocated_blocks
         self.canonical_lengths[chunk.chunk_id] = length
@@ -232,7 +277,7 @@ class BlockManager:
         """Creates a private Copy-on-Write shadow block for a bridge repair.
 
         Replaces the logical table entry with the new shadow block, leaving the
-        original canonical physical block intact and unmodified in HBM.
+        original canonical physical block intact and unmodified in memory.
         """
         log_block = table.blocks[logical_idx]
         old_phys_id = log_block.physical_idx
@@ -247,6 +292,10 @@ class BlockManager:
         # Copy existing contents from canonical block to shadow block
         self.k_pool[new_phys_id].copy_(self.k_pool[old_phys_id])
         self.v_pool[new_phys_id].copy_(self.v_pool[old_phys_id])
+
+        if self.quantization == "int8" and self.k_scale_pool is not None:
+            self.k_scale_pool[new_phys_id].copy_(self.k_scale_pool[old_phys_id])
+            self.v_scale_pool[new_phys_id].copy_(self.v_scale_pool[old_phys_id])
 
         # Release refcount on old canonical block
         self.free_block(old_phys_id)
