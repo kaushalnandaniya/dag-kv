@@ -12,11 +12,11 @@ from dag_kv.core.rope_adjoint import compute_inv_freq
 from dag_kv.core.sink_canonicalizer import CanonicalChunk, SinkCanonicalizer
 from dag_kv.devices.device_manager import get_device_manager
 from dag_kv.devices.shard_config import ShardConfig, QuantizationMode
-from dag_kv.kernels.dispatch import (
+from dag_kv.kernels import (
     adjoint_paged_attention,
     sparse_bridge_attention,
+    _GLOBAL_COS_SIN_CACHE,
 )
-from dag_kv.kernels.triton_adjoint_paged_attn import _GLOBAL_COS_SIN_CACHE
 
 
 class Qwen2DAGKVEngine:

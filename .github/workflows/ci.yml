@@ -26,10 +26,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install PyTorch
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            pip install torch
+          fi
+
+      - name: Install dependencies
+        run: |
           pip install -e ".[dev]"
 
       - name: Verify CLI Info & Device Discovery

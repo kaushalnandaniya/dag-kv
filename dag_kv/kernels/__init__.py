@@ -31,4 +31,5 @@ __all__ = [
     "pytorch_sparse_bridge_attention",
     "triton_adjoint_paged_attention",
     "triton_sparse_bridge_attention",
+    "_GLOBAL_COS_SIN_CACHE",
 ]
