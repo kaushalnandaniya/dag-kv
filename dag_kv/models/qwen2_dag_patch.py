@@ -227,8 +227,19 @@ class Qwen2DAGKVEngine:
         if self._sink_phys_block is None:
             s_len = self._num_sink
             sink_blk = self.block_manager.allocate_block(is_canonical=True, chunk_id="__canonical_sink__")
-            self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = all_k[:, :, :s_len, :].to(self.dtype)
-            self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = all_v[:, :, :s_len, :].to(self.dtype)
+            sink_k = all_k[:, :, :s_len, :].to(self.device, dtype=self.dtype)
+            sink_v = all_v[:, :, :s_len, :].to(self.device, dtype=self.dtype)
+            if self.block_manager.quantization == "int8":
+                from dag_kv import KVQuantizer
+                qk, sk = KVQuantizer.quantize_int8(sink_k, dim=-1)
+                qv, sv = KVQuantizer.quantize_int8(sink_v, dim=-1)
+                self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
+                self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
+                self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
+                self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
+            else:
+                self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = sink_k
+                self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = sink_v
             self._sink_phys_block = sink_blk
 
         canonical_chunk = self.canonicalizer.canonicalize_kv(
@@ -524,34 +535,37 @@ class Qwen2DAGKVEngine:
         temperature: float = 0.0,
     ) -> Tuple[List[int], str]:
         table, doc_tokens = self.assemble_prompt_dag(chunks, seq_id="gen_seq")
-        self.repair_bridge_tokens(table, chunks)
+        try:
+            self.repair_bridge_tokens(table, chunks)
 
-        suffix_ids = self.tokenizer.encode(prompt_suffix, add_special_tokens=False)
-        curr_pos = len(doc_tokens)
+            suffix_ids = self.tokenizer.encode(prompt_suffix, add_special_tokens=False)
+            curr_pos = len(doc_tokens)
 
-        last_logits = None
-        for tok in suffix_ids:
-            last_logits = self.append_and_decode(table, token_id=tok, current_pos=curr_pos)
-            curr_pos += 1
+            last_logits = None
+            for tok in suffix_ids:
+                last_logits = self.append_and_decode(table, token_id=tok, current_pos=curr_pos)
+                curr_pos += 1
 
-        if last_logits is None:
-            last_logits = self.append_and_decode(table, token_id=doc_tokens[-1], current_pos=curr_pos)
-            curr_pos += 1
+            if last_logits is None:
+                last_logits = self.append_and_decode(table, token_id=doc_tokens[-1], current_pos=curr_pos)
+                curr_pos += 1
 
-        generated = []
-        for _ in range(max_new_tokens):
-            if temperature == 0.0:
-                next_tok = torch.argmax(last_logits, dim=-1).item()
-            else:
-                probs = torch.softmax(last_logits / temperature, dim=-1)
-                next_tok = torch.multinomial(probs, num_samples=1).item()
+            generated = []
+            for _ in range(max_new_tokens):
+                if temperature == 0.0:
+                    next_tok = torch.argmax(last_logits, dim=-1).item()
+                else:
+                    probs = torch.softmax(last_logits / temperature, dim=-1)
+                    next_tok = torch.multinomial(probs, num_samples=1).item()
 
-            generated.append(next_tok)
-            if next_tok == self.tokenizer.eos_token_id:
-                break
+                generated.append(next_tok)
+                if next_tok == self.tokenizer.eos_token_id:
+                    break
 
-            last_logits = self.append_and_decode(table, token_id=next_tok, current_pos=curr_pos)
-            curr_pos += 1
+                last_logits = self.append_and_decode(table, token_id=next_tok, current_pos=curr_pos)
+                curr_pos += 1
 
-        text = self.tokenizer.decode(generated, skip_special_tokens=True)
-        return generated, text
+            text = self.tokenizer.decode(generated, skip_special_tokens=True)
+            return generated, text
+        finally:
+            self.block_manager.free_sequence(table)

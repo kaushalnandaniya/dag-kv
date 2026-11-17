@@ -34,6 +34,14 @@ class DAGKVModelWrapper:
         if shard_config is None:
             dev_mgr = get_device_manager()
             self.shard_config = dev_mgr.auto_detect_topology(block_size=block_size)
+            try:
+                p = next(model.parameters())
+                self.shard_config.device = p.device
+                self.shard_config.kv_device = p.device
+                self.shard_config.prefill_device = p.device
+                self.shard_config.dtype = p.dtype
+            except StopIteration:
+                pass
             self.shard_config.max_num_blocks = max_num_blocks
             self.shard_config.bridge_top_k = bridge_top_k
             if quantization != "none":

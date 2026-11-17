@@ -304,3 +304,9 @@ class BlockManager:
         log_block.physical_idx = new_phys_id
         log_block.is_cow_shadow = True
         return new_phys_id
+
+    def free_sequence(self, table: OffsetBlockTable):
+        """Releases all logical block references held by a completed sequence table."""
+        for log_block in table.blocks:
+            self.free_block(log_block.physical_idx)
+        table.blocks.clear()

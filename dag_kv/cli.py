@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import re
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,7 @@ def cmd_serve(args):
                 block_size=block_size,
             )
             self.chunk_cache = {}
+            self.lock = threading.RLock()
             self.total_requests = 0
             self.total_file_hits = 0
 
@@ -88,27 +90,28 @@ def cmd_serve(args):
 
             active_chunks = []
             hits = 0
-            for seg in file_segments:
-                h_key = hashlib.sha256(seg.encode("utf-8")).hexdigest()[:16]
-                if h_key in self.chunk_cache:
-                    active_chunks.append(self.chunk_cache[h_key])
-                    hits += 1
-                    self.total_file_hits += 1
-                else:
-                    chunk = self.model.prefill_chunk(seg)
-                    self.chunk_cache[h_key] = chunk
-                    active_chunks.append(chunk)
+            with self.lock:
+                for seg in file_segments:
+                    h_key = hashlib.sha256(seg.encode("utf-8")).hexdigest()[:16]
+                    if h_key in self.chunk_cache:
+                        active_chunks.append(self.chunk_cache[h_key])
+                        hits += 1
+                        self.total_file_hits += 1
+                    else:
+                        chunk = self.model.prefill_chunk(seg)
+                        self.chunk_cache[h_key] = chunk
+                        active_chunks.append(chunk)
 
-            if not active_chunks:
-                chunk = self.model.prefill_chunk(query_str or "Hello")
-                active_chunks = [chunk]
-                query_str = ""
+                if not active_chunks:
+                    chunk = self.model.prefill_chunk(query_str or "Hello")
+                    active_chunks = [chunk]
+                    query_str = ""
 
-            answer = self.model.generate(
-                chunks=active_chunks,
-                prompt_suffix=query_str,
-                max_new_tokens=max_tokens,
-            ).strip()
+                answer = self.model.generate(
+                    chunks=active_chunks,
+                    prompt_suffix=query_str,
+                    max_new_tokens=max_tokens,
+                ).strip()
             total_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
             return {
