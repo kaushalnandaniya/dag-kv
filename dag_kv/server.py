@@ -14,15 +14,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Tuple
 import torch
 
-from benchmarks.bench_7b_realworld_rag import DualGPUSharded7BEngine
-from benchmarks.bench_batched_lru_serving import LRUCacheManager
-from benchmarks.bench_multiuser_codebase import release_request_blocks
+
 
 
 class DAGKVService:
     """Manages canonical file KV blocks, LRU eviction, and DAG stitching for HTTP requests."""
 
     def __init__(self, model_name: str = "Qwen/Qwen2.5-7B-Instruct", max_num_blocks: int = 768):
+        from benchmarks.bench_7b_realworld_rag import DualGPUSharded7BEngine
+        from benchmarks.bench_batched_lru_serving import LRUCacheManager
         self.engine = DualGPUSharded7BEngine(model_name=model_name, max_num_blocks=max_num_blocks)
         self.lru = LRUCacheManager(self.engine.bm_0, self.engine.bm_1)
         self.total_requests = 0
@@ -108,6 +108,7 @@ class DAGKVService:
         stitch_decode_ms = (time.perf_counter() - t_stitch_start) * 1000.0
         total_ms = (time.perf_counter() - t_start) * 1000.0
 
+        from benchmarks.bench_multiuser_codebase import release_request_blocks
         release_request_blocks(self.engine, table)
 
         raw_ans = self.engine.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()

@@ -60,7 +60,7 @@ class DAGKVModelWrapper:
     ) -> "DAGKVModelWrapper":
         """Instantiates model and tokenizer with automatic hardware routing."""
         dev_mgr = get_device_manager()
-        target_device = torch.device(device) if device is not None else dev_mgr.primary_device
+        target_device = dev_mgr.primary_device if (device is None or device == "auto") else torch.device(device)
 
         dtype = torch.float16 if target_device.type == "cuda" else torch.float32
 
