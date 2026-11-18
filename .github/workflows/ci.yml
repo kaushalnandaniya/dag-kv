@@ -45,4 +45,16 @@ jobs:
 
       - name: Run Test Suite (PyTorch Fallbacks & CPU Mocked)
         run: |
-          pytest -v tests/test_core_components.py tests/test_rope_adjoint.py tests/test_pytorch_fallback.py tests/test_device_manager.py tests/test_quantization.py tests/test_dynamic_blocks.py tests/test_hf_integration.py
+          pytest -v \
+            tests/test_core_components.py \
+            tests/test_rope_adjoint.py \
+            tests/test_pytorch_fallback.py \
+            tests/test_device_manager.py \
+            tests/test_quantization.py \
+            tests/test_dynamic_blocks.py \
+            tests/test_hf_integration.py \
+            tests/test_lru_eviction.py \
+            tests/test_fused_int4.py \
+            tests/test_model_generalization.py \
+            tests/test_disk_persistence.py \
+            tests/test_continuous_batching.py
