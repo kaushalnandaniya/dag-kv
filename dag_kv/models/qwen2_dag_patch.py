@@ -311,7 +311,7 @@ class Qwen2DAGKVEngine:
             target_chunk = chunks[chunk_idx]
             l_target = target_chunk.length
 
-            k_prior_list = [prior_c.k_cache[1] for prior_c in chunks[:chunk_idx]]
+            k_prior_list = [prior_c.k_cache[1].to(self.device) for prior_c in chunks[:chunk_idx]]
             k_prior = torch.cat(k_prior_list, dim=1).to(self.device)
 
             q_target = target_chunk.k_cache[1].to(self.device)
