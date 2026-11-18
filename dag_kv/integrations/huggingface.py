@@ -12,7 +12,7 @@ from dag_kv.core.block_manager import BlockManager, OffsetBlockTable
 from dag_kv.core.sink_canonicalizer import CanonicalChunk, SinkCanonicalizer
 from dag_kv.devices.device_manager import get_device_manager
 from dag_kv.devices.shard_config import QuantizationMode, ShardConfig
-from dag_kv.models.qwen2_dag_patch import Qwen2DAGKVEngine
+from dag_kv.models import AutoDAGKVEngine, Qwen2DAGKVEngine
 
 
 class DAGKVModelWrapper:
@@ -49,7 +49,7 @@ class DAGKVModelWrapper:
         else:
             self.shard_config = shard_config
 
-        self.engine = Qwen2DAGKVEngine(
+        self.engine = AutoDAGKVEngine.from_model(
             model=model,
             tokenizer=tokenizer,
             shard_config=self.shard_config,

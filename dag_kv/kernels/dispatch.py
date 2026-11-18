@@ -13,7 +13,10 @@ _HAS_TRITON = False
 try:
     import triton
     import triton.language as tl
-    from .triton_adjoint_paged_attn import triton_adjoint_paged_attention
+    from .triton_adjoint_paged_attn import (
+        triton_adjoint_paged_attention,
+        triton_adjoint_paged_attention_int4,
+    )
     from .triton_sparse_stitch import triton_sparse_bridge_attention
     _HAS_TRITON = True
 except (ImportError, Exception):
@@ -46,6 +49,37 @@ def adjoint_paged_attention(
     Dispatches to Triton on CUDA devices for maximum throughput.
     Falls back to vectorized PyTorch on CPU, Apple Silicon (MPS), or INT8 pools.
     """
+    can_use_triton_int4 = (
+        _HAS_TRITON
+        and prefer_triton
+        and q.is_cuda
+        and k_pool.is_cuda
+        and k_scales is not None
+        and v_scales is not None
+        and k_pool.dtype == torch.uint8
+        and v_pool.dtype == torch.uint8
+    )
+
+    if can_use_triton_int4:
+        try:
+            return triton_adjoint_paged_attention_int4(
+                q=q,
+                k_pool=k_pool,
+                v_pool=v_pool,
+                k_scales=k_scales,
+                v_scales=v_scales,
+                block_tables=block_tables,
+                offset_tables=offset_tables,
+                seq_lens=seq_lens,
+                sm_scale=sm_scale,
+                base=base,
+                block_start_tables=block_start_tables,
+                valid_lens_tables=valid_lens_tables,
+                delta_bias=delta_bias,
+            )
+        except Exception:
+            pass
+
     can_use_triton = (
         _HAS_TRITON
         and prefer_triton

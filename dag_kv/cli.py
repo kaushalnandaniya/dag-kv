@@ -48,6 +48,45 @@ def cmd_info(args):
 
 def cmd_serve(args):
     """Launches the universal OpenAI-compatible HTTP server."""
+    if getattr(args, "continuous_batching", True):
+        import asyncio
+        from dag_kv.serving import ContinuousBatchingScheduler, AsyncServer
+        from dag_kv.models import AutoDAGKVEngine
+        from dag_kv.persistence import DiskKVCache
+
+        disk_store = DiskKVCache(args.cache_dir) if (getattr(args, "persist", False) or getattr(args, "cache_dir", None)) else None
+        print(f"Starting DAG-KV Continuous Batching Server on {args.host}:{args.port}")
+        print(f"Model: {args.model} | Device: {args.device} | Quantization: {args.quantization} | Max Batch: {args.batch_size}")
+
+        target_dev = None if args.device == "auto" else args.device
+        engine = AutoDAGKVEngine.from_pretrained(
+            args.model,
+            device=target_dev,
+            quantization=args.quantization,
+            max_num_blocks=args.max_blocks,
+            block_size=args.block_size,
+            disk_store=disk_store,
+        )
+        scheduler = ContinuousBatchingScheduler(engine=engine, max_batch_size=args.batch_size)
+        server = AsyncServer(scheduler=scheduler, host=args.host, port=args.port)
+
+        async def _run():
+            await server.start()
+            print(f"DAG-KV Server listening on http://{args.host}:{args.port}")
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            finally:
+                await server.stop()
+
+        try:
+            asyncio.run(_run())
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+        return
+
     from dag_kv.integrations.huggingface import DAGKVModelWrapper
 
     print(f"Starting DAG-KV HTTP Server on {args.host}:{args.port}")
@@ -189,6 +228,10 @@ def main():
     p_serve.add_argument("--quantization", type=str, default="none", choices=["none", "int8", "int4"], help="KV cache quantization")
     p_serve.add_argument("--max-blocks", type=int, default=2048, help="Maximum physical blocks in KV pool")
     p_serve.add_argument("--block-size", type=int, default=16, help="Tokens per physical block (8, 16, 32, 64)")
+    p_serve.add_argument("--continuous-batching", action="store_true", default=True, help="Enable async continuous batching scheduler")
+    p_serve.add_argument("--batch-size", type=int, default=16, help="Max batch size for continuous batching")
+    p_serve.add_argument("--cache-dir", type=str, default=None, help="NVMe persistent cache directory")
+    p_serve.add_argument("--persist", action="store_true", default=False, help="Enable disk KV persistence")
 
     args = parser.parse_args()
 

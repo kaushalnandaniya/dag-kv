@@ -102,13 +102,26 @@ def pytorch_adjoint_paged_attention(
             q_adj = apply_adjoint_rope(q_b, delta=delta, dim=head_dim, base=base)
 
             # Fetch keys and values: (num_kv_heads, block_size, head_dim)
-            k_blk = k_pool[phys_block, :, :, :].to(torch.float32)
-            v_blk = v_pool[phys_block, :, :, :].to(torch.float32)
+            k_blk = k_pool[phys_block, :, :, :]
+            v_blk = v_pool[phys_block, :, :, :]
 
             if k_scales is not None:
-                k_blk = k_blk * k_scales[phys_block]
+                if k_pool.dtype == torch.uint8:
+                    from dag_kv.core.quantizer import KVQuantizer
+                    k_blk = KVQuantizer.dequantize_int4(k_blk, k_scales[phys_block], out_dtype=torch.float32)
+                else:
+                    k_blk = k_blk.to(torch.float32) * k_scales[phys_block]
+            else:
+                k_blk = k_blk.to(torch.float32)
+
             if v_scales is not None:
-                v_blk = v_blk * v_scales[phys_block]
+                if v_pool.dtype == torch.uint8:
+                    from dag_kv.core.quantizer import KVQuantizer
+                    v_blk = KVQuantizer.dequantize_int4(v_blk, v_scales[phys_block], out_dtype=torch.float32)
+                else:
+                    v_blk = v_blk.to(torch.float32) * v_scales[phys_block]
+            else:
+                v_blk = v_blk.to(torch.float32)
 
             # GQA expansion: repeat kv heads to match query heads
             if gqa_ratio > 1:
@@ -238,13 +251,26 @@ def pytorch_sparse_bridge_attention(
                 # Adjoint counter-rotation R(-Delta)
                 q_adj = apply_adjoint_rope(q_br, delta=delta, dim=head_dim, base=base)
 
-                k_blk = k_pool[phys_block, :, :, :].to(torch.float32)
-                v_blk = v_pool[phys_block, :, :, :].to(torch.float32)
+                k_blk = k_pool[phys_block, :, :, :]
+                v_blk = v_pool[phys_block, :, :, :]
 
                 if k_scales is not None:
-                    k_blk = k_blk * k_scales[phys_block]
+                    if k_pool.dtype == torch.uint8:
+                        from dag_kv.core.quantizer import KVQuantizer
+                        k_blk = KVQuantizer.dequantize_int4(k_blk, k_scales[phys_block], out_dtype=torch.float32)
+                    else:
+                        k_blk = k_blk.to(torch.float32) * k_scales[phys_block]
+                else:
+                    k_blk = k_blk.to(torch.float32)
+
                 if v_scales is not None:
-                    v_blk = v_blk * v_scales[phys_block]
+                    if v_pool.dtype == torch.uint8:
+                        from dag_kv.core.quantizer import KVQuantizer
+                        v_blk = KVQuantizer.dequantize_int4(v_blk, v_scales[phys_block], out_dtype=torch.float32)
+                    else:
+                        v_blk = v_blk.to(torch.float32) * v_scales[phys_block]
+                else:
+                    v_blk = v_blk.to(torch.float32)
 
                 if gqa_ratio > 1:
                     k_blk = k_blk.repeat_interleave(gqa_ratio, dim=0)

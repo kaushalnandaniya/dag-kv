@@ -2,7 +2,8 @@
 
 [![Hardware: NVIDIA | AMD ROCm | Apple Silicon MPS | CPU](https://img.shields.io/badge/Hardware-NVIDIA%20%7C%20AMD%20ROCm%20%7C%20Apple%20Silicon%20%7C%20CPU-76B900)](https://pytorch.org)
 [![Execution: Triton JIT + PyTorch Native Fallback](https://img.shields.io/badge/Kernels-Triton%20%2B%20PyTorch%20Fallback-orange)](dag_kv/kernels/)
-[![Tests: 43/43 Passed](https://img.shields.io/badge/Tests-43%2F43%20Passed-brightgreen)](tests/)
+[![Tests: 65/65 Passed](https://img.shields.io/badge/Tests-65%2F65%20Passed-brightgreen)](tests/)
+[![Release: v0.3.0](https://img.shields.io/badge/Release-v0.3.0-blue)](pyproject.toml)
 [![Paper: PDF](https://img.shields.io/badge/Paper-PDF-red?logo=adobeacrobatreader)](paper/dag_kv_paper.pdf)
 [![CI/CD: Multi-Arch Matrix](https://img.shields.io/badge/CI%2FCD-Ubuntu%20%7C%20macOS-blue?logo=githubactions)](.github/workflows/ci.yml)
 [![Docker: Multi-Arch amd64/arm64](https://img.shields.io/badge/Docker-Multi--Arch%20(amd64%2Farm64)-2496ED?logo=docker)](Dockerfile)
@@ -20,6 +21,11 @@ Existing prefix-caching architectures (e.g., **vLLM Automatic Prefix Caching**, 
 - **Query-Side Adjoint RoPE:** Exploits the orthogonal adjoint identity in $SO(2)$ to counter-rotate query vectors in GPU/CPU registers ($q_{\text{adj}} = \mathcal{R}(-\Delta) \tilde{q}$), leaving cached Key blocks **100% read-only and zero-copy in memory**.
 - **Canonical Sink Prefix:** Neutralizes the position-zero attention sink pathology by prepending a 4-token system sink during isolated prefill and slicing it off before registration.
 - **LSE Perturbation Bound & Submodular Bridge Repair:** Uses Layer-1 Online Softmax perturbation scalars $\alpha_i = \sigma(\ell_{i \to \text{prior}} - \ell_i^{\text{local}})$ with quality-diversity non-maximum suppression to select sparse Bridge Tokens for ragged micro-prefill, storing repaired keys into request-private **Copy-on-Write (CoW) Shadow Blocks** while reusing **92%–96% of the canonical KV cache untouched**.
+- **Continuous Batching & Async Engine (v0.3.0):** Concurrent GPU decode batching with `ContinuousBatchingScheduler` and OpenAI-compatible SSE streaming (`/v1/chat/completions`).
+- **Reference-Counted LRU Eviction (v0.3.0):** Automatic pruning of cold canonical chunks upon memory pressure, respecting CoW references without OOM aborts.
+- **Fused INT4 SRAM Triton Kernels (v0.3.0):** On-the-fly bit-unpacked INT4 dequantization directly inside Triton SRAM loops, cutting KV memory bandwidth by 75% compared to FP16.
+- **Model Generalization (v0.3.0):** Model-agnostic base engine supporting Meta Llama-3, Mistral, Google Gemma-2, and Qwen-2 via `AutoDAGKVEngine`.
+- **Persistent Disk KV Cache (v0.3.0):** Zero-copy safetensors-backed NVMe persistence and pinned host RAM DMA staging (`DiskKVCache` + `PinnedCPUPool`).
 - **Hardware Abstraction Layer (HAL):** Dynamic device manager with auto-discovery, topology auto-configuration (Single-GPU, Multi-GPU Pipeline, Apple Silicon MPS, CPU, and CPU-offloaded KV pooling), adaptive INT8/INT4 quantization, and seamless drop-in integrations for **Hugging Face** and **vLLM**.
 
 > **Research Paper:** Read the complete 3-page manuscript in [`paper/dag_kv_paper.pdf`](paper/dag_kv_paper.pdf).
@@ -252,11 +258,22 @@ dag-kv/
 │   │   ├── huggingface.py            # Drop-in DAGKVModelWrapper & patch_hf_model adapter
 │   │   └── vllm.py                   # DAGKVvLLMBlockManagerPlugin for vLLM continuous batching
 │   ├── models/
-│   │   └── qwen2_dag_patch.py        # End-to-end Qwen2 inference engine with universal dispatch
+│   │   ├── base_engine.py            # Model-agnostic DAGKVEngine base class for DAG assembly & decode
+│   │   ├── auto_engine.py            # AutoDAGKVEngine dynamic architecture router
+│   │   ├── llama_engine.py           # Meta Llama-3 / Llama-3.1 DAG-KV engine
+│   │   ├── mistral_engine.py         # Mistral-7B / Mixtral DAG-KV engine
+│   │   ├── gemma_engine.py           # Google Gemma-2 DAG-KV engine
+│   │   └── qwen2_dag_patch.py        # Alibaba Qwen-2 / Qwen-2.5 DAG-KV engine
+│   ├── persistence/
+│   │   ├── disk_cache.py             # Zero-copy safetensors NVMe disk cache for canonical chunks
+│   │   └── pinned_cpu_pool.py        # Page-locked (pinned) Host RAM pool for high-speed DMA staging
+│   ├── serving/
+│   │   ├── scheduler.py              # Async ContinuousBatchingScheduler with dynamic decode batching
+│   │   └── async_server.py           # High-throughput asyncio HTTP/1.1 and SSE streaming server
 │   ├── worker/
 │   │   ├── universal_pipeline.py     # Universal single/dual device & CPU-offloaded pipeline
 │   │   └── dual_gpu_pipeline.py      # Dedicated Dual-GPU async prefill-decode pipeline
-│   ├── cli.py                        # Command line interface (dag-kv info, serve)
+│   ├── cli.py                        # Command line interface (dag-kv info, serve, --continuous-batching)
 │   └── server.py                     # OpenAI-compatible /v1/chat/completions HTTP server
 ├── configs/
 │   └── hw_rtx2080ti.yaml             # Turing SM75 tile configs, memory constraints, dual-GPU pipeline
@@ -268,13 +285,13 @@ dag-kv/
 ├── .github/workflows/
 │   └── ci.yml                        # GitHub Actions Multi-Platform CI workflow
 ├── Dockerfile                        # Multi-Arch Production Dockerfile (linux/amd64, linux/arm64)
-├── tests/                            # 43/43 Passing Tests (CPU fallbacks, GPU Triton, HAL, Quant)
+├── tests/                            # 65/65 Passing Tests (Continuous batching, LRU, INT4, Multi-Model, Disk)
 └── benchmarks/                       # Production evaluation & benchmark suite
 ```
 
 ---
 
-## Test Suite (43/43 Tests Passing)
+## Test Suite (65/65 Tests Passing)
 
 Run the entire test suite across hardware backends:
 ```bash
@@ -282,35 +299,57 @@ pytest -v tests/
 ```
 Output:
 ```text
-tests/test_core_components.py::test_sink_canonicalizer PASSED            [  2%]
-tests/test_core_components.py::test_lse_probe_and_bridge_selection PASSED [  4%]
-tests/test_core_components.py::test_block_manager_cow_and_assembly PASSED [  6%]
-tests/test_device_manager.py::test_device_manager_singleton_and_probing PASSED [  9%]
-tests/test_device_manager.py::test_shard_config_presets PASSED           [ 11%]
-tests/test_device_manager.py::test_auto_detect_topology PASSED           [ 13%]
-tests/test_dual_gpu_pipeline.py::test_dual_gpu_disaggregated_prefill_and_stitch PASSED [ 16%]
-tests/test_dynamic_blocks.py::test_dynamic_block_size_allocation[8] PASSED [ 18%]
-tests/test_dynamic_blocks.py::test_dynamic_block_size_allocation[16] PASSED [ 20%]
-tests/test_dynamic_blocks.py::test_dynamic_block_size_allocation[32] PASSED [ 23%]
-tests/test_dynamic_blocks.py::test_attention_with_variable_block_sizes[8] PASSED [ 25%]
-tests/test_dynamic_blocks.py::test_attention_with_variable_block_sizes[32] PASSED [ 27%]
-tests/test_hf_integration.py::test_vllm_block_manager_plugin PASSED      [ 30%]
-tests/test_hf_integration.py::test_hf_wrapper_cpu_offline PASSED         [ 32%]
-tests/test_pytorch_fallback.py::test_pytorch_adjoint_paged_attention_cpu PASSED [ 34%]
-tests/test_pytorch_fallback.py::test_pytorch_vs_triton_adjoint_paged_attention_parity PASSED [ 37%]
-tests/test_pytorch_fallback.py::test_pytorch_vs_triton_sparse_bridge_parity PASSED [ 39%]
-tests/test_quantization.py::test_kv_quantizer_int8_accuracy PASSED       [ 41%]
-tests/test_quantization.py::test_kv_quantizer_int4_accuracy PASSED       [ 44%]
-tests/test_quantization.py::test_block_manager_int8_quantization_lifecycle PASSED [ 46%]
-tests/test_rope_adjoint.py::test_rope_adjoint_identity_scalar ... PASSED [ 65%]
-tests/test_rope_adjoint.py::test_rope_adjoint_batched_multihead ... PASSED [ 74%]
-tests/test_rope_adjoint.py::test_rotate_half_orthogonality PASSED        [ 76%]
-tests/test_sparse_bridge_e2e.py::test_qwen2_dag_kv_e2e_stitching_and_repair PASSED [ 79%]
-tests/test_triton_sm75.py::test_triton_adjoint_paged_attention_accuracy ... PASSED [ 93%]
-tests/test_triton_sm75.py::test_triton_sparse_bridge_attention_accuracy ... PASSED [ 97%]
+tests/test_brutal_stress.py::test_stress_1_sha256_dedup_and_permutation_invariance PASSED [  1%]
+tests/test_brutal_stress.py::test_stress_2_quantization_and_lse_bridge_selection PASSED [  3%]
+tests/test_brutal_stress.py::test_stress_3_kv_pool_exhaustion_and_cow_refcount PASSED [  4%]
+tests/test_brutal_stress.py::test_stress_4_extreme_32k_rope_gqa_and_parity PASSED [  6%]
+tests/test_brutal_stress.py::test_stress_5_multithreaded_http_server_hammering PASSED [  7%]
+tests/test_brutal_stress.py::test_stress_6_dual_gpu_and_exception_rollback PASSED [  9%]
+tests/test_continuous_batching.py::test_continuous_batching_scheduler PASSED [ 10%]
+tests/test_continuous_batching.py::test_async_server_http_and_sse PASSED [ 12%]
+tests/test_core_components.py::test_sink_canonicalizer PASSED            [ 13%]
+tests/test_core_components.py::test_lse_probe_and_bridge_selection PASSED [ 15%]
+tests/test_core_components.py::test_block_manager_cow_and_assembly PASSED [ 16%]
+tests/test_device_manager.py::test_device_manager_singleton_and_probing PASSED [ 18%]
+tests/test_device_manager.py::test_shard_config_presets PASSED           [ 20%]
+tests/test_device_manager.py::test_auto_detect_topology PASSED           [ 21%]
+tests/test_disk_persistence.py::test_disk_kv_cache_save_and_load PASSED  [ 23%]
+tests/test_disk_persistence.py::test_persistence_across_simulated_restart PASSED [ 24%]
+tests/test_disk_persistence.py::test_pinned_cpu_pool_transfer PASSED     [ 26%]
+tests/test_disk_persistence.py::test_engine_disk_cache_zero_prefill PASSED [ 27%]
+tests/test_dual_gpu_pipeline.py::test_dual_gpu_disaggregated_prefill_and_stitch PASSED [ 29%]
+tests/test_dynamic_blocks.py::test_dynamic_block_size_allocation[8] PASSED [ 30%]
+tests/test_dynamic_blocks.py::test_dynamic_block_size_allocation[16] PASSED [ 32%]
+tests/test_dynamic_blocks.py::test_dynamic_block_size_allocation[32] PASSED [ 33%]
+tests/test_dynamic_blocks.py::test_attention_with_variable_block_sizes[8] PASSED [ 35%]
+tests/test_dynamic_blocks.py::test_attention_with_variable_block_sizes[32] PASSED [ 36%]
+tests/test_fused_int4.py::test_block_manager_int4_allocation PASSED      [ 38%]
+tests/test_fused_int4.py::test_pytorch_int4_fallback_cpu PASSED          [ 40%]
+tests/test_fused_int4.py::test_fused_int4_triton_vs_pytorch_parity PASSED [ 41%]
+tests/test_hf_integration.py::test_vllm_block_manager_plugin PASSED      [ 43%]
+tests/test_hf_integration.py::test_hf_wrapper_cpu_offline PASSED         [ 44%]
+tests/test_lru_eviction.py::test_lru_eviction_lifecycle PASSED           [ 46%]
+tests/test_lru_eviction.py::test_lru_protection_of_active_sequences PASSED [ 47%]
+tests/test_lru_eviction.py::test_ensure_capacity_and_exhaustion PASSED   [ 49%]
+tests/test_model_generalization.py::test_auto_engine_routing PASSED      [ 50%]
+tests/test_model_generalization.py::test_llama_end_to_end_dag PASSED     [ 52%]
+tests/test_model_generalization.py::test_mistral_end_to_end_dag PASSED   [ 53%]
+tests/test_model_generalization.py::test_gemma2_end_to_end_dag PASSED    [ 55%]
+tests/test_pytorch_fallback.py::test_pytorch_adjoint_paged_attention_cpu PASSED [ 56%]
+tests/test_pytorch_fallback.py::test_pytorch_vs_triton_adjoint_paged_attention_parity PASSED [ 58%]
+tests/test_pytorch_fallback.py::test_pytorch_vs_triton_sparse_bridge_parity PASSED [ 60%]
+tests/test_quantization.py::test_kv_quantizer_int8_accuracy PASSED       [ 61%]
+tests/test_quantization.py::test_kv_quantizer_int4_accuracy PASSED       [ 63%]
+tests/test_quantization.py::test_block_manager_int8_quantization_lifecycle PASSED [ 64%]
+tests/test_rope_adjoint.py::test_rope_adjoint_identity_scalar ... PASSED [ 76%]
+tests/test_rope_adjoint.py::test_rope_adjoint_batched_multihead ... PASSED [ 83%]
+tests/test_rotate_half_orthogonality PASSED        [ 84%]
+tests/test_sparse_bridge_e2e.py::test_qwen2_dag_kv_e2e_stitching_and_repair PASSED [ 86%]
+tests/test_triton_sm75.py::test_triton_adjoint_paged_attention_accuracy ... PASSED [ 95%]
+tests/test_triton_sm75.py::test_triton_sparse_bridge_attention_accuracy ... PASSED [ 98%]
 tests/test_triton_sm75.py::test_turing_sm75_shared_memory_limits PASSED  [100%]
 
-============================= 43 passed in 45.73s ==============================
+============================= 65 passed in 188.22s =============================
 ```
 
 ---

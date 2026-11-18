@@ -9,8 +9,10 @@ Manages physical KV cache memory across hardware platforms:
 6. Pinned Host Memory for CPU-Offloaded KV Pooling.
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple, Union
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import torch
 
 from .quantizer import KVQuantizer
@@ -119,6 +121,8 @@ class BlockManager:
         dtype: Optional[torch.dtype] = None,
         quantization: str = "none",
         pin_memory: bool = False,
+        enable_lru: bool = True,
+        disk_store: Optional[Any] = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -128,6 +132,8 @@ class BlockManager:
         self.device = torch.device(device)
         self.quantization = quantization.lower()
         self.pin_memory = pin_memory
+        self.enable_lru = enable_lru
+        self.disk_store = disk_store
 
         # Determine optimal computation and storage dtype
         if dtype is not None:
@@ -140,11 +146,17 @@ class BlockManager:
             else:
                 self.dtype = torch.float32
 
-        self.storage_dtype = torch.int8 if self.quantization == "int8" else self.dtype
+        if self.quantization == "int8":
+            self.storage_dtype = torch.int8
+        elif self.quantization == "int4":
+            self.storage_dtype = torch.uint8
+        else:
+            self.storage_dtype = self.dtype
 
         # Allocate physical memory pool
-        # Shape: (max_num_blocks, num_layers, num_kv_heads, block_size, head_dim)
-        pool_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, head_dim)
+        # For INT4, the last dimension is packed (head_dim // 2) bytes
+        pool_head_dim = head_dim // 2 if self.quantization == "int4" else head_dim
+        pool_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, pool_head_dim)
 
         if self.device.type == "cpu" and self.pin_memory and torch.cuda.is_available():
             self.k_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device="cpu").pin_memory()
@@ -153,8 +165,8 @@ class BlockManager:
             self.k_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device=self.device)
             self.v_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device=self.device)
 
-        # Quantization scale pools for INT8
-        if self.quantization == "int8":
+        # Quantization scale pools for INT8 and INT4
+        if self.quantization in ("int8", "int4"):
             scale_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, 1)
             scale_dtype = torch.float32 if self.device.type == "cpu" else torch.float16
             self.k_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)
@@ -172,11 +184,74 @@ class BlockManager:
         # Canonical Content Registry: chunk_id (SHA256) -> list of physical block IDs
         self.canonical_registry: Dict[str, List[int]] = {}
         self.canonical_lengths: Dict[str, int] = {}
+        self.canonical_lru: OrderedDict[str, float] = OrderedDict()
+        self.evictions: int = 0
+
+    def touch(self, chunk_id: str):
+        """Refreshes a chunk's position in the LRU eviction queue."""
+        if chunk_id in self.canonical_lru:
+            self.canonical_lru.move_to_end(chunk_id)
+
+    def is_chunk_evictable(self, chunk_id: str) -> bool:
+        """Returns True if chunk is in canonical registry and has zero active sequences (ref_count == 1)."""
+        if chunk_id not in self.canonical_registry:
+            return False
+        for b_id in self.canonical_registry[chunk_id]:
+            if self.physical_metadata[b_id].ref_count > 1:
+                return False
+        return True
+
+    def evict_chunk(self, chunk_id: str) -> bool:
+        """Evicts an unreferenced canonical chunk from physical memory pools."""
+        if not self.is_chunk_evictable(chunk_id):
+            return False
+
+        if self.disk_store is not None and hasattr(self.disk_store, "on_evict"):
+            try:
+                self.disk_store.on_evict(self, chunk_id)
+            except Exception:
+                pass
+
+        for b_id in self.canonical_registry[chunk_id]:
+            self.free_block(b_id)
+
+        self.canonical_registry.pop(chunk_id, None)
+        self.canonical_lengths.pop(chunk_id, None)
+        self.canonical_lru.pop(chunk_id, None)
+        self.evictions += 1
+        return True
+
+    def evict_lru(self, protected_chunks: Optional[Set[str]] = None) -> bool:
+        """Evicts the coldest unreferenced canonical chunk."""
+        protected = set(protected_chunks or [])
+        for c_id in list(self.canonical_lru.keys()):
+            if c_id not in protected and self.is_chunk_evictable(c_id):
+                return self.evict_chunk(c_id)
+        return False
+
+    def ensure_capacity(self, blocks_needed: int, protected_chunks: Optional[Set[str]] = None) -> int:
+        """Proactively frees canonical blocks until at least `blocks_needed` are available."""
+        protected = set(protected_chunks or [])
+        freed = 0
+        while len(self.free_blocks) < blocks_needed:
+            if not self.evict_lru(protected_chunks=protected):
+                break
+            freed += 1
+        return freed
 
     def allocate_block(self, is_canonical: bool = False, chunk_id: Optional[str] = None) -> int:
-        """Allocates a single physical block."""
+        """Allocates a single physical block with automatic LRU eviction fallback."""
+        if not self.free_blocks and self.enable_lru:
+            while not self.free_blocks:
+                evicted = self.evict_lru()
+                if not evicted:
+                    break
+
         if not self.free_blocks:
-            raise MemoryError(f"DAG-KV BlockManager out of memory: {self.max_num_blocks} blocks exhausted")
+            raise MemoryError(
+                f"DAG-KV BlockManager out of memory: {self.max_num_blocks} blocks exhausted "
+                "and no inactive canonical chunks available for LRU eviction"
+            )
         block_id = self.free_blocks.pop(0)
         meta = self.physical_metadata[block_id]
         meta.ref_count = 1
@@ -197,9 +272,10 @@ class BlockManager:
     def register_canonical_chunk(self, chunk: CanonicalChunk) -> List[int]:
         """Loads a CanonicalChunk into read-only physical pool blocks.
 
-        Deduplicates via SHA256: if already cached, increments ref count.
+        Deduplicates via SHA256: if already cached, increments ref count and touches LRU.
         """
         if chunk.chunk_id in self.canonical_registry:
+            self.touch(chunk.chunk_id)
             block_ids = self.canonical_registry[chunk.chunk_id]
             for b_id in block_ids:
                 self.physical_metadata[b_id].ref_count += 1
@@ -212,10 +288,13 @@ class BlockManager:
         k_cache = chunk.k_cache.to(self.device, dtype=self.dtype)
         v_cache = chunk.v_cache.to(self.device, dtype=self.dtype)
 
-        # Handle INT8 quantization during chunk registration
+        # Handle INT8 / INT4 quantization during chunk registration
         if self.quantization == "int8":
             k_storage, k_scale = KVQuantizer.quantize_int8(k_cache, dim=-1)
             v_storage, v_scale = KVQuantizer.quantize_int8(v_cache, dim=-1)
+        elif self.quantization == "int4":
+            k_storage, k_scale = KVQuantizer.quantize_int4(k_cache, dim=-1)
+            v_storage, v_scale = KVQuantizer.quantize_int4(v_cache, dim=-1)
         else:
             k_storage = k_cache
             v_storage = v_cache
@@ -235,12 +314,13 @@ class BlockManager:
             self.k_pool[phys_id, :, :, :block_len, :] = k_storage[:, :, start:end, :]
             self.v_pool[phys_id, :, :, :block_len, :] = v_storage[:, :, start:end, :]
 
-            if self.quantization == "int8" and k_scale is not None and v_scale is not None:
+            if self.quantization in ("int8", "int4") and k_scale is not None and v_scale is not None:
                 self.k_scale_pool[phys_id, :, :, :block_len, :] = k_scale[:, :, start:end, :]
                 self.v_scale_pool[phys_id, :, :, :block_len, :] = v_scale[:, :, start:end, :]
 
         self.canonical_registry[chunk.chunk_id] = allocated_blocks
         self.canonical_lengths[chunk.chunk_id] = length
+        self.canonical_lru[chunk.chunk_id] = time.time()
         return allocated_blocks
 
     def assemble_dag_sequence(
@@ -259,6 +339,7 @@ class BlockManager:
         for chunk, global_start in chunk_sequence:
             delta = global_start - 4  # Canonical sink offset
             phys_blocks = self.register_canonical_chunk(chunk)
+            self.touch(chunk.chunk_id)
 
             remaining = chunk.length
             for p_id in phys_blocks:
@@ -293,7 +374,7 @@ class BlockManager:
         self.k_pool[new_phys_id].copy_(self.k_pool[old_phys_id])
         self.v_pool[new_phys_id].copy_(self.v_pool[old_phys_id])
 
-        if self.quantization == "int8" and self.k_scale_pool is not None:
+        if self.quantization in ("int8", "int4") and self.k_scale_pool is not None:
             self.k_scale_pool[new_phys_id].copy_(self.k_scale_pool[old_phys_id])
             self.v_scale_pool[new_phys_id].copy_(self.v_scale_pool[old_phys_id])
 
