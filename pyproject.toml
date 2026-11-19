@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dag-kv"
-version = "0.3.0"
+version = "0.3.1"
 description = "Universal Position-Decoupled Graph KV Cache with Query-Side Adjoint RoPE & LSE-Bounded Sparse Bridge Repair"
 authors = [{ name = "Kaushal Nandaniya" }]
 license = "Apache-2.0"
