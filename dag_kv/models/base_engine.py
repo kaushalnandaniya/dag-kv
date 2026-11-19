@@ -69,7 +69,7 @@ class DAGKVEngine(ABC):
         self.num_heads = self._get_num_heads()
         self.num_kv_heads = self._get_num_kv_heads()
         self.head_dim = self._get_head_dim()
-        self.sm_scale = 1.0 / math.sqrt(self.head_dim)
+        self.sm_scale = self._get_sm_scale()
 
         self.rope_base = self._get_rope_base()
         self.inv_freq = self._get_inv_freq()
@@ -148,6 +148,9 @@ class DAGKVEngine(ABC):
 
     def get_final_norm(self, h: torch.Tensor) -> torch.Tensor:
         return self.model.model.norm(h)
+
+    def _get_sm_scale(self) -> float:
+        return 1.0 / math.sqrt(self.head_dim)
 
     def get_lm_head(self, h: torch.Tensor) -> torch.Tensor:
         return self.model.lm_head(h)

@@ -15,6 +15,19 @@ class Gemma2DAGKVEngine(DAGKVEngine):
     def _get_head_dim(self) -> int:
         return getattr(self.config, "head_dim", 256)
 
+    def _get_sm_scale(self) -> float:
+        scalar = getattr(self.config, "query_pre_attn_scalar", None)
+        if scalar is not None and scalar > 0:
+            return float(scalar) ** -0.5
+        return 1.0 / math.sqrt(self.head_dim)
+
+    def get_lm_head(self, h: torch.Tensor) -> torch.Tensor:
+        logits = self.model.lm_head(h)
+        cap = getattr(self.config, "final_logit_softcapping", None)
+        if cap is not None and cap > 0:
+            logits = torch.tanh(logits / cap) * cap
+        return logits
+
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Gemma multiplies input embeddings by sqrt(hidden_size)."""
         emb = self.model.get_input_embeddings()(token_ids).to(self.dtype)
