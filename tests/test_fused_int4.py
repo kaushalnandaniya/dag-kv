@@ -30,7 +30,7 @@ def test_block_manager_int4_allocation():
     assert bm.k_pool.shape == (8, 4, 2, 16, 32)  # 64 // 2 = 32 bytes
     assert bm.v_pool.shape == (8, 4, 2, 16, 32)
     assert bm.k_scale_pool is not None
-    assert bm.k_scale_pool.shape == (8, 4, 2, 16, 1)
+    assert bm.k_scale_pool.shape == (8, 4, 2, 16, 2)
 
     k_orig = torch.randn(4, 2, 16, 64, dtype=torch.float32)
     v_orig = torch.randn(4, 2, 16, 64, dtype=torch.float32)

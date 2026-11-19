@@ -167,7 +167,8 @@ class BlockManager:
 
         # Quantization scale pools for INT8 and INT4
         if self.quantization in ("int8", "int4"):
-            scale_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, 1)
+            scale_last_dim = KVQuantizer.num_int4_groups(head_dim) if self.quantization == "int4" else 1
+            scale_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, scale_last_dim)
             scale_dtype = torch.float32 if self.device.type == "cpu" else torch.float16
             self.k_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)
             self.v_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)

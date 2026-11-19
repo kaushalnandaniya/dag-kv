@@ -171,6 +171,73 @@ class DAGKVEngine(ABC):
     # --- Canonical Prefill, DAG Stitching, and Bridge Repair ---
 
     @torch.inference_mode()
+    def _ensure_sink_block_initialized(self) -> None:
+        """Initializes the shared canonical sink block (positions 0..num_sink-1) if missing.
+
+        Ensures warm restarts loading 100% of chunks from DiskKVCache still have
+        valid attention sink KV states at positions 0..num_sink-1.
+        """
+        if self._sink_phys_block is not None or self._num_sink <= 0:
+            return
+
+        sink_ids = torch.tensor(
+            [list(self.canonicalizer.sink_token_ids)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        s_len = sink_ids.shape[-1]
+        pos_ids = torch.arange(s_len, dtype=torch.int64, device=self.device).unsqueeze(0)
+        attn_mask = torch.ones((1, s_len), dtype=torch.int64, device=self.device)
+
+        outputs = self.model(
+            input_ids=sink_ids,
+            attention_mask=attn_mask,
+            position_ids=pos_ids,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        pkv = outputs.past_key_values
+        layer_k, layer_v = [], []
+        for l_idx in range(self.num_layers):
+            if hasattr(pkv, "layers"):
+                k_l = pkv.layers[l_idx].keys.squeeze(0)
+                v_l = pkv.layers[l_idx].values.squeeze(0)
+            elif hasattr(pkv, "key_cache"):
+                k_l = pkv.key_cache[l_idx].squeeze(0)
+                v_l = pkv.value_cache[l_idx].squeeze(0)
+            else:
+                k_l = pkv[l_idx][0].squeeze(0)
+                v_l = pkv[l_idx][1].squeeze(0)
+            layer_k.append(k_l)
+            layer_v.append(v_l)
+
+        sink_k = torch.stack(layer_k, dim=0).to(self.device, dtype=self.dtype)
+        sink_v = torch.stack(layer_v, dim=0).to(self.device, dtype=self.dtype)
+        sink_blk = self.block_manager.allocate_block(is_canonical=True, chunk_id="__canonical_sink__")
+
+        if self.block_manager.quantization == "int8":
+            from dag_kv.core.quantizer import KVQuantizer
+            qk, sk = KVQuantizer.quantize_int8(sink_k, dim=-1)
+            qv, sv = KVQuantizer.quantize_int8(sink_v, dim=-1)
+            self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
+            self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
+            self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
+            self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
+        elif self.block_manager.quantization == "int4":
+            from dag_kv.core.quantizer import KVQuantizer
+            qk, sk = KVQuantizer.quantize_int4(sink_k, dim=-1)
+            qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1)
+            self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
+            self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
+            self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
+            self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
+        else:
+            self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = sink_k
+            self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = sink_v
+
+        self._sink_phys_block = sink_blk
+
+    @torch.inference_mode()
     def prefill_canonical_chunk(
         self,
         content: Union[str, List[int], torch.Tensor],
@@ -196,6 +263,7 @@ class DAGKVEngine(ABC):
         if self.block_manager.disk_store is not None and hasattr(self.block_manager.disk_store, "load_chunk"):
             disk_chunk = self.block_manager.disk_store.load_chunk(chunk_hash, device=self.device, dtype=self.dtype)
             if disk_chunk is not None:
+                self._ensure_sink_block_initialized()
                 self.block_manager.register_canonical_chunk(disk_chunk)
                 self._chunk_cache[chunk_hash] = disk_chunk
                 return disk_chunk
@@ -282,6 +350,8 @@ class DAGKVEngine(ABC):
         )
 
         self.block_manager.register_canonical_chunk(canonical_chunk)
+        if self.block_manager.disk_store is not None and hasattr(self.block_manager.disk_store, "save_chunk"):
+            self.block_manager.disk_store.save_chunk(canonical_chunk, metadata=metadata)
         self._chunk_cache[chunk_hash] = canonical_chunk
         return canonical_chunk
 

@@ -152,6 +152,7 @@ def triton_adjoint_paged_attention(
     base: float = 10000.0,
     block_start_tables: Optional[torch.Tensor] = None,
     valid_lens_tables: Optional[torch.Tensor] = None,
+    delta_bias: int = 32768,
 ) -> torch.Tensor:
     assert q.dtype == torch.float16, "Turing sm_75 constraint: q must be float16"
     assert k_pool.dtype == torch.float16, "Turing sm_75 constraint: k_pool must be float16"
@@ -176,7 +177,7 @@ def triton_adjoint_paged_attention(
         ).to(torch.int32).contiguous()
 
     cos_cache, sin_cache, delta_bias = get_cos_sin_cache(
-        head_dim=head_dim, base=base, max_delta=16384, device=q.device
+        head_dim=head_dim, base=base, max_delta=delta_bias, device=q.device
     )
 
     out = torch.empty_like(q)
@@ -290,8 +291,8 @@ def _triton_adjoint_paged_attn_int4_decode_kernel(
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_ksb, stride_ksh, stride_ksn,
-    stride_vsb, stride_vsh, stride_vsn,
+    stride_ksb, stride_ksh, stride_ksn, stride_ksg,
+    stride_vsb, stride_vsh, stride_vsn, stride_vsg,
     stride_ob, stride_oh, stride_om, stride_od,
     stride_btb, stride_btn,
     stride_otb, stride_otn,
@@ -304,6 +305,7 @@ def _triton_adjoint_paged_attn_int4_decode_kernel(
     num_kv_heads: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    GROUP_HALF_DIM: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -315,6 +317,7 @@ def _triton_adjoint_paged_attn_int4_decode_kernel(
 
     HALF_DIM: tl.constexpr = HEAD_DIM // 2
     offs_half = tl.arange(0, HALF_DIM)
+    group_idx = offs_half // GROUP_HALF_DIM
     offs_even = offs_half * 2
     offs_odd = offs_half * 2 + 1
 
@@ -366,22 +369,23 @@ def _triton_adjoint_paged_attn_int4_decode_kernel(
             )
             k_packed = tl.load(k_ptrs, mask=k_mask, other=0)
 
-            # Load K scales: (BLOCK_SIZE,)
+            # Load per-group K scales: (BLOCK_SIZE, HALF_DIM)
             k_scale_ptrs = (
                 K_scale_ptr
                 + phys_block * stride_ksb
                 + kv_head * stride_ksh
-                + offs_n * stride_ksn
+                + offs_n[:, None] * stride_ksn
+                + group_idx[None, :] * stride_ksg
             )
-            k_scales = tl.load(k_scale_ptrs, mask=valid_mask, other=0.0).to(tl.float32)
+            k_scales = tl.load(k_scale_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-            # Unpack nibbles: low = even index, high = odd index
-            k_low = ((k_packed & 0x0F).to(tl.int32) - 8).to(tl.float32)
-            k_high = (((k_packed >> 4) & 0x0F).to(tl.int32) - 8).to(tl.float32)
+            # Unpack & dequantize nibbles in SRAM: low = even index, high = odd index
+            k_low = ((k_packed & 0x0F).to(tl.int32) - 8).to(tl.float32) * k_scales
+            k_high = (((k_packed >> 4) & 0x0F).to(tl.int32) - 8).to(tl.float32) * k_scales
 
             dot_even = tl.sum(k_low * q_adj_even[None, :], 1)
             dot_odd = tl.sum(k_high * q_adj_odd[None, :], 1)
-            scores = (dot_even + dot_odd) * k_scales * sm_scale
+            scores = (dot_even + dot_odd) * sm_scale
             scores = tl.where(valid_mask, scores, -float("inf"))
 
             m_curr = tl.max(scores, 0)
@@ -402,21 +406,21 @@ def _triton_adjoint_paged_attn_int4_decode_kernel(
             )
             v_packed = tl.load(v_ptrs, mask=k_mask, other=0)
 
-            # Load V scales: (BLOCK_SIZE,)
+            # Load per-group V scales: (BLOCK_SIZE, HALF_DIM)
             v_scale_ptrs = (
                 V_scale_ptr
                 + phys_block * stride_vsb
                 + kv_head * stride_vsh
-                + offs_n * stride_vsn
+                + offs_n[:, None] * stride_vsn
+                + group_idx[None, :] * stride_vsg
             )
-            v_scales = tl.load(v_scale_ptrs, mask=valid_mask, other=0.0).to(tl.float32)
+            v_scales = tl.load(v_scale_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-            v_low = ((v_packed & 0x0F).to(tl.int32) - 8).to(tl.float32)
-            v_high = (((v_packed >> 4) & 0x0F).to(tl.int32) - 8).to(tl.float32)
+            v_low = ((v_packed & 0x0F).to(tl.int32) - 8).to(tl.float32) * v_scales
+            v_high = (((v_packed >> 4) & 0x0F).to(tl.int32) - 8).to(tl.float32) * v_scales
 
-            p_scaled = p * v_scales
-            acc_even = alpha * acc_even + tl.sum(p_scaled[:, None] * v_low, 0)
-            acc_odd = alpha * acc_odd + tl.sum(p_scaled[:, None] * v_high, 0)
+            acc_even = alpha * acc_even + tl.sum(p[:, None] * v_low, 0)
+            acc_odd = alpha * acc_odd + tl.sum(p[:, None] * v_high, 0)
 
             m_prev = m_new
             l_prev = l_new
@@ -444,7 +448,7 @@ def triton_adjoint_paged_attention_int4(
     base: float = 10000.0,
     block_start_tables: Optional[torch.Tensor] = None,
     valid_lens_tables: Optional[torch.Tensor] = None,
-    delta_bias: int = 16384,
+    delta_bias: int = 32768,
 ) -> torch.Tensor:
     """Fused INT4 Adjoint PagedAttention with SRAM dequantization."""
     assert q.dtype == torch.float16, "q must be float16"
@@ -473,10 +477,12 @@ def triton_adjoint_paged_attention_int4(
         head_dim=head_dim, base=base, max_delta=delta_bias, device=q.device
     )
 
-    k_scales_s = k_scales.squeeze(-1) if k_scales.dim() == 4 else k_scales
-    v_scales_s = v_scales.squeeze(-1) if v_scales.dim() == 4 else v_scales
+    k_scales_s = k_scales.unsqueeze(-1) if k_scales.dim() == 3 else k_scales
+    v_scales_s = v_scales.unsqueeze(-1) if v_scales.dim() == 3 else v_scales
     k_scales_s = k_scales_s.to(dtype=torch.float16)
     v_scales_s = v_scales_s.to(dtype=torch.float16)
+    num_groups = k_scales_s.shape[-1]
+    group_half_dim = (head_dim // 2) // num_groups
 
     out = torch.empty_like(q)
     grid = (batch_size, num_heads)
@@ -491,8 +497,8 @@ def triton_adjoint_paged_attention_int4(
             stride_qb=q.stride(0), stride_qh=q.stride(1), stride_qm=q.stride(2), stride_qd=q.stride(3),
             stride_kb=k_pool.stride(0), stride_kh=k_pool.stride(1), stride_kn=k_pool.stride(2), stride_kd=k_pool.stride(3),
             stride_vb=v_pool.stride(0), stride_vh=v_pool.stride(1), stride_vn=v_pool.stride(2), stride_vd=v_pool.stride(3),
-            stride_ksb=k_scales_s.stride(0), stride_ksh=k_scales_s.stride(1), stride_ksn=k_scales_s.stride(2),
-            stride_vsb=v_scales_s.stride(0), stride_vsh=v_scales_s.stride(1), stride_vsn=v_scales_s.stride(2),
+            stride_ksb=k_scales_s.stride(0), stride_ksh=k_scales_s.stride(1), stride_ksn=k_scales_s.stride(2), stride_ksg=k_scales_s.stride(3),
+            stride_vsb=v_scales_s.stride(0), stride_vsh=v_scales_s.stride(1), stride_vsn=v_scales_s.stride(2), stride_vsg=v_scales_s.stride(3),
             stride_ob=out.stride(0), stride_oh=out.stride(1), stride_om=out.stride(2), stride_od=out.stride(3),
             stride_btb=block_tables.stride(0), stride_btn=block_tables.stride(1),
             stride_otb=offset_tables.stride(0), stride_otn=offset_tables.stride(1),
@@ -505,6 +511,7 @@ def triton_adjoint_paged_attention_int4(
             num_kv_heads=num_kv_heads,
             BLOCK_SIZE=block_size,
             HEAD_DIM=head_dim,
+            GROUP_HALF_DIM=group_half_dim,
             num_warps=4,
             num_stages=2,
         )

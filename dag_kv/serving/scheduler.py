@@ -89,6 +89,8 @@ class ContinuousBatchingScheduler:
         self.total_file_lookups = 0
         self.total_file_hits = 0
         self.completed_requests = 0
+        self._assistant_suffix: Optional[str] = None
+        self._eos_token_ids = self._resolve_eos_token_ids()
 
     def start(self):
         """Starts the continuous batching worker loop."""
@@ -187,91 +189,163 @@ class ContinuousBatchingScheduler:
             },
         }
 
+    def _resolve_eos_token_ids(self) -> set:
+        """Collects all valid EOS/stop token IDs from tokenizer and generation_config."""
+        eos_ids = set()
+        candidates = [getattr(self.engine.tokenizer, "eos_token_id", None)]
+        gen_cfg = getattr(getattr(self.engine, "model", None), "generation_config", None)
+        if gen_cfg is not None:
+            candidates.append(getattr(gen_cfg, "eos_token_id", None))
+        for item in candidates:
+            if isinstance(item, int):
+                eos_ids.add(item)
+            elif isinstance(item, (list, tuple, set)):
+                eos_ids.update(x for x in item if isinstance(x, int))
+        return eos_ids
+
+    def _get_assistant_turn_suffix(self) -> str:
+        """Derives the user-close + assistant-open turn marker from the tokenizer's chat template."""
+        if self._assistant_suffix is not None:
+            return self._assistant_suffix
+        tok = self.engine.tokenizer
+        suffix = ""
+        if getattr(tok, "chat_template", None) and hasattr(tok, "apply_chat_template"):
+            try:
+                sentinel = "__DAGKV_TURN_SPLIT__"
+                rendered = tok.apply_chat_template(
+                    [{"role": "user", "content": sentinel}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if sentinel in rendered:
+                    suffix = rendered.split(sentinel, 1)[1]
+            except Exception:
+                suffix = ""
+        self._assistant_suffix = suffix
+        return suffix
+
+    async def _emit_token_and_check_done(self, req: RequestState) -> bool:
+        """Pushes req.last_token to output_queue and returns True if request finished."""
+        next_tok = req.last_token
+        tok_str = self.engine.tokenizer.decode([next_tok])
+        is_eos = next_tok in self._eos_token_ids
+        reached_limit = len(req.generated_tokens) >= req.max_new_tokens
+
+        if is_eos or reached_limit:
+            req.status = "FINISHED"
+            req.finish_reason = "stop" if is_eos else "length"
+            if not is_eos:
+                await req.output_queue.put({"token": tok_str, "token_id": next_tok, "done": False})
+            await req.output_queue.put({"done": True, "finish_reason": req.finish_reason})
+            if req.table is not None:
+                self.engine.block_manager.free_sequence(req.table)
+                req.table = None
+            self.completed_requests += 1
+            return True
+
+        await req.output_queue.put({"token": tok_str, "token_id": next_tok, "done": False})
+        return False
+
     async def _scheduler_loop(self):
         """Infinite worker loop advancing admitted requests on each step."""
         while self._running:
             try:
-                # 1. Admit new requests up to max_batch_size
+                # 1. Admit new requests up to max_batch_size without starving the event loop
                 while len(self.running_batch) < self.max_batch_size and not self.waiting_queue.empty():
                     req = self.waiting_queue.get_nowait()
                     try:
-                        self._prefill_request(req)
-                        self.running_batch.append(req)
+                        await asyncio.to_thread(self._prefill_request, req)
+                        finished = await self._emit_token_and_check_done(req)
+                        if not finished:
+                            self.running_batch.append(req)
+                        await asyncio.sleep(0)
                     except Exception as e:
                         req.status = "ERROR"
                         req.error = e
+                        if req.table is not None:
+                            try:
+                                self.engine.block_manager.free_sequence(req.table)
+                                req.table = None
+                            except Exception:
+                                pass
                         await req.output_queue.put({"error": e, "done": True})
 
                 if not self.running_batch:
                     await asyncio.sleep(self.step_interval_s)
                     continue
 
-                # 2. Execute one batched decode step across all running sequences
+                # 2. Execute one batched decode step off the event-loop thread
                 t0 = time.perf_counter()
-                self._batched_decode_step()
+                await asyncio.to_thread(self._batched_decode_step)
                 step_ms = (time.perf_counter() - t0) * 1000.0
 
-                # 3. Check completions and notify streams
+                # 3. Emit tokens and flush SSE writers immediately
                 still_running = []
                 for req in self.running_batch:
                     req.decode_ms += step_ms
-                    next_tok = req.last_token
-                    tok_str = self.engine.tokenizer.decode([next_tok])
-
-                    is_eos = next_tok == getattr(self.engine.tokenizer, "eos_token_id", None)
-                    reached_limit = len(req.generated_tokens) >= req.max_new_tokens
-
-                    if is_eos or reached_limit:
-                        req.status = "FINISHED"
-                        req.finish_reason = "stop" if is_eos else "length"
-                        if not is_eos:
-                            await req.output_queue.put({"token": tok_str, "token_id": next_tok, "done": False})
-                        await req.output_queue.put({"done": True, "finish_reason": req.finish_reason})
-                        # Clean up memory pool blocks
-                        if req.table is not None:
-                            self.engine.block_manager.free_sequence(req.table)
-                            req.table = None
-                        self.completed_requests += 1
-                    else:
-                        await req.output_queue.put({"token": tok_str, "token_id": next_tok, "done": False})
+                    finished = await self._emit_token_and_check_done(req)
+                    if not finished:
                         still_running.append(req)
 
                 self.running_batch = still_running
+                await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                # If unexpected step crash occurs, notify all running requests
                 for req in self.running_batch:
                     if req.table is not None:
                         try:
                             self.engine.block_manager.free_sequence(req.table)
+                            req.table = None
                         except Exception:
                             pass
                     await req.output_queue.put({"error": e, "done": True})
                 self.running_batch.clear()
                 await asyncio.sleep(self.step_interval_s)
 
+    def _sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
+        if temperature <= 0.0:
+            return int(torch.argmax(logits, dim=-1).item())
+        probs = torch.softmax(logits / temperature, dim=-1)
+        return int(torch.multinomial(probs, num_samples=1).item())
+
     def _prefill_request(self, req: RequestState):
         """Assembles prompt DAG and runs micro-prefill repair for newly admitted request."""
         t_start = time.perf_counter()
         active_chunks = []
+        disk_store = getattr(self.engine.block_manager, "disk_store", None)
+
         for seg in req.file_segments:
             self.total_file_lookups += 1
-            h_key = hashlib.sha256(seg.encode("utf-8")).hexdigest()
-            if h_key in self.engine._chunk_cache:
+            tok_ids = torch.tensor(
+                self.engine.tokenizer.encode(seg, add_special_tokens=False),
+                dtype=torch.int64,
+                device=self.engine.device,
+            )
+            h_key = self.engine.canonicalizer.compute_chunk_hash(tok_ids)
+            in_ram = h_key in self.engine._chunk_cache
+            in_disk = (
+                not in_ram
+                and disk_store is not None
+                and hasattr(disk_store, "_get_chunk_path")
+                and disk_store._get_chunk_path(h_key).exists()
+            )
+            if in_ram or in_disk:
                 self.total_file_hits += 1
-                active_chunks.append(self.engine._chunk_cache[h_key])
-            else:
-                chunk = self.engine.prefill_canonical_chunk(seg)
-                active_chunks.append(chunk)
+            chunk = self.engine.prefill_canonical_chunk(tok_ids)
+            active_chunks.append(chunk)
 
         table, doc_tokens = self.engine.assemble_prompt_dag(active_chunks, seq_id=req.request_id)
         if len(active_chunks) > 1:
             self.engine.repair_bridge_tokens(table, active_chunks)
 
         # Decode user query prompt suffix tokens sequentially to prepare decode head
-        q_ids = self.engine.tokenizer.encode(req.query_str, add_special_tokens=False) if req.query_str else []
+        turn_suffix = self._get_assistant_turn_suffix()
+        query_text = req.query_str or ""
+        if turn_suffix and not query_text.endswith(turn_suffix):
+            query_text = query_text + turn_suffix
+        q_ids = self.engine.tokenizer.encode(query_text, add_special_tokens=False) if query_text else []
         cur_pos = len(doc_tokens)
         last_logits = None
 
@@ -284,7 +358,7 @@ class ContinuousBatchingScheduler:
             last_logits = self.engine.append_and_decode(table, token_id=init_tok, current_pos=cur_pos)
             cur_pos += 1
 
-        next_tok = int(torch.argmax(last_logits, dim=-1).item())
+        next_tok = self._sample_next_token(last_logits, req.temperature)
 
         req.table = table
         req.active_chunks = active_chunks
@@ -305,16 +379,10 @@ class ContinuousBatchingScheduler:
         tokens = [r.last_token for r in self.running_batch]
         positions = [r.current_pos for r in self.running_batch]
 
-        # Use model-agnostic batched forward pass on GPU
         logits_b = self.engine.batched_append_and_decode(tables, tokens, positions)
 
         for i, req in enumerate(self.running_batch):
-            if req.temperature <= 0.0:
-                next_tok = int(torch.argmax(logits_b[i], dim=-1).item())
-            else:
-                probs = torch.softmax(logits_b[i] / req.temperature, dim=-1)
-                next_tok = int(torch.multinomial(probs, num_samples=1).item())
-
+            next_tok = self._sample_next_token(logits_b[i], req.temperature)
             req.last_token = next_tok
             req.current_pos += 1
             req.generated_tokens.append(next_tok)

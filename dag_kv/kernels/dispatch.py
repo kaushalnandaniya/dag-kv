@@ -42,7 +42,7 @@ def adjoint_paged_attention(
     k_scales: Optional[torch.Tensor] = None,
     v_scales: Optional[torch.Tensor] = None,
     prefer_triton: bool = True,
-    delta_bias: int = 16384,
+    delta_bias: int = 32768,
 ) -> torch.Tensor:
     """Universal Adjoint PagedAttention with automated backend dispatch.
 
@@ -139,7 +139,7 @@ def sparse_bridge_attention(
     k_scales: Optional[torch.Tensor] = None,
     v_scales: Optional[torch.Tensor] = None,
     prefer_triton: bool = True,
-    delta_bias: int = 16384,
+    delta_bias: int = 32768,
 ) -> torch.Tensor:
     """Universal Sparse Bridge Ragged Micro-Prefill with automated backend dispatch."""
     can_use_triton = (
