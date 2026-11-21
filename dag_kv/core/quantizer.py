@@ -12,6 +12,8 @@ class KVQuantizer:
     """Vectorized symmetric quantizer and dequantizer for KV cache tensors."""
 
     INT4_GROUP_SIZE: int = 32
+    INT4_K_GROUP_SIZE = 8
+    INT4_V_GROUP_SIZE = 32
 
     @classmethod
     def num_int4_groups(cls, head_dim: int, group_size: Optional[int] = None) -> int:

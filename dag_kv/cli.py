@@ -225,7 +225,7 @@ def main():
     p_serve.add_argument("--port", type=int, default=8000, help="Port to bind")
     p_serve.add_argument("--model", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="HuggingFace model ID")
     p_serve.add_argument("--device", type=str, default="auto", help="Compute device ('auto', 'cuda:0', 'mps', 'cpu')")
-    p_serve.add_argument("--quantization", type=str, default="none", choices=["none", "int8", "int4"], help="KV cache quantization")
+    p_serve.add_argument("--quantization", type=str, default="none", choices=["none", "int8", "k8v4", "int4"], help="KV cache quantization")
     p_serve.add_argument("--max-blocks", type=int, default=2048, help="Maximum physical blocks in KV pool")
     p_serve.add_argument("--block-size", type=int, default=16, help="Tokens per physical block (8, 16, 32, 64)")
     p_serve.add_argument("--continuous-batching", action="store_true", default=True, help="Enable async continuous batching scheduler")

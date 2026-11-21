@@ -1,6 +1,6 @@
 """DAG-KV: Position-Decoupled Graph KV Cache with Query-Side Adjoint RoPE & LSE-Bounded Sparse Bridge Repair."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from .core.block_manager import BlockManager, OffsetBlockTable, LogicalBlock, PhysicalBlock
 from .core.lse_probe import LSEProbe, compute_lse_perturbation, select_bridge_tokens

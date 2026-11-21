@@ -115,7 +115,14 @@ class DAGKVEngine(ABC):
         return getattr(self.config, "head_dim", self.config.hidden_size // self.num_heads)
 
     def _get_rope_base(self) -> float:
-        return getattr(self.config, "rope_theta", 10000.0) or 10000.0
+        theta = getattr(self.config, "rope_theta", None)
+        if theta is None:
+            for attr in ("rope_scaling", "rope_parameters"):
+                cfg_dict = getattr(self.config, attr, None)
+                if isinstance(cfg_dict, dict) and cfg_dict.get("rope_theta") is not None:
+                    theta = cfg_dict["rope_theta"]
+                    break
+        return float(theta) if theta is not None else 10000.0
 
     def _get_inv_freq(self) -> torch.Tensor:
         rot_emb = getattr(getattr(self.model, "model", self.model), "rotary_emb", None)
@@ -159,14 +166,19 @@ class DAGKVEngine(ABC):
         return self.model.get_input_embeddings()(token_ids).to(self.dtype)
 
     def _init_rope_cache(self):
-        max_delta = 16384
+        max_delta = 32768
         deltas = torch.arange(-max_delta, max_delta + 1, device=self.device, dtype=torch.float32)
         angles = deltas.unsqueeze(-1) * self.inv_freq.unsqueeze(0)
         angles = torch.cat([angles, angles], dim=-1)
         cos_cache = torch.cos(angles).to(dtype=self.dtype)
         sin_cache = torch.sin(angles).to(dtype=self.dtype)
-        key = (self.head_dim, self.rope_base, max_delta, self.device)
-        _GLOBAL_COS_SIN_CACHE[key] = (cos_cache, sin_cache, max_delta)
+        _GLOBAL_COS_SIN_CACHE[(self.head_dim, self.rope_base, 32768, self.device)] = (
+            cos_cache, sin_cache, 32768
+        )
+        # Zero-copy slice for legacy callers requesting max_delta=16384
+        _GLOBAL_COS_SIN_CACHE[(self.head_dim, self.rope_base, 16384, self.device)] = (
+            cos_cache[16384 : 16384 + 32769], sin_cache[16384 : 16384 + 32769], 16384
+        )
 
     # --- Canonical Prefill, DAG Stitching, and Bridge Repair ---
 
@@ -223,10 +235,18 @@ class DAGKVEngine(ABC):
             self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
             self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
             self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
+        elif self.block_manager.quantization == "k8v4":
+            from dag_kv.core.quantizer import KVQuantizer
+            qk, sk = KVQuantizer.quantize_int8(sink_k, dim=-1)
+            qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+            self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
+            self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
+            self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
+            self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
         elif self.block_manager.quantization == "int4":
             from dag_kv.core.quantizer import KVQuantizer
-            qk, sk = KVQuantizer.quantize_int4(sink_k, dim=-1)
-            qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1)
+            qk, sk = KVQuantizer.quantize_int4(sink_k, dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+            qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
             self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
             self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
             self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
@@ -328,10 +348,18 @@ class DAGKVEngine(ABC):
                 self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
                 self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
                 self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
+            elif self.block_manager.quantization == "k8v4":
+                from dag_kv.core.quantizer import KVQuantizer
+                qk, sk = KVQuantizer.quantize_int8(sink_k, dim=-1)
+                qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+                self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
+                self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
+                self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
+                self.block_manager.v_scale_pool[sink_blk, :, :, :s_len, :] = sv
             elif self.block_manager.quantization == "int4":
                 from dag_kv.core.quantizer import KVQuantizer
-                qk, sk = KVQuantizer.quantize_int4(sink_k, dim=-1)
-                qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1)
+                qk, sk = KVQuantizer.quantize_int4(sink_k, dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+                qv, sv = KVQuantizer.quantize_int4(sink_v, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
                 self.block_manager.k_pool[sink_blk, :, :, :s_len, :] = qk
                 self.block_manager.v_pool[sink_blk, :, :, :s_len, :] = qv
                 self.block_manager.k_scale_pool[sink_blk, :, :, :s_len, :] = sk
@@ -499,10 +527,20 @@ class DAGKVEngine(ABC):
                 self.block_manager.v_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vsc
                 k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
                 v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
+            elif self.block_manager.quantization == "k8v4":
+                from dag_kv.core.quantizer import KVQuantizer
+                kq, ksc = KVQuantizer.quantize_int8(k_rot.transpose(0, 1), dim=-1)
+                vq, vsc = KVQuantizer.quantize_int4(v.transpose(0, 1), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+                self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = kq
+                self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vq
+                self.block_manager.k_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = ksc
+                self.block_manager.v_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vsc
+                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
+                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
             elif self.block_manager.quantization == "int4":
                 from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int4(k_rot.transpose(0, 1), dim=-1)
-                vq, vsc = KVQuantizer.quantize_int4(v.transpose(0, 1), dim=-1)
+                kq, ksc = KVQuantizer.quantize_int4(k_rot.transpose(0, 1), dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+                vq, vsc = KVQuantizer.quantize_int4(v.transpose(0, 1), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
                 self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = kq
                 self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vq
                 self.block_manager.k_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = ksc
@@ -614,10 +652,20 @@ class DAGKVEngine(ABC):
                 self.block_manager.v_scale_pool[phys_t, l_idx, :, slots_t, :] = vsc
                 k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
                 v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
+            elif self.block_manager.quantization == "k8v4":
+                from dag_kv.core.quantizer import KVQuantizer
+                kq, ksc = KVQuantizer.quantize_int8(k_rot.squeeze(2), dim=-1)
+                vq, vsc = KVQuantizer.quantize_int4(v.squeeze(2), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+                self.block_manager.k_pool[phys_t, l_idx, :, slots_t, :] = kq
+                self.block_manager.v_pool[phys_t, l_idx, :, slots_t, :] = vq
+                self.block_manager.k_scale_pool[phys_t, l_idx, :, slots_t, :] = ksc
+                self.block_manager.v_scale_pool[phys_t, l_idx, :, slots_t, :] = vsc
+                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
+                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
             elif self.block_manager.quantization == "int4":
                 from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int4(k_rot.squeeze(2), dim=-1)
-                vq, vsc = KVQuantizer.quantize_int4(v.squeeze(2), dim=-1)
+                kq, ksc = KVQuantizer.quantize_int4(k_rot.squeeze(2), dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+                vq, vsc = KVQuantizer.quantize_int4(v.squeeze(2), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
                 self.block_manager.k_pool[phys_t, l_idx, :, slots_t, :] = kq
                 self.block_manager.v_pool[phys_t, l_idx, :, slots_t, :] = vq
                 self.block_manager.k_scale_pool[phys_t, l_idx, :, slots_t, :] = ksc

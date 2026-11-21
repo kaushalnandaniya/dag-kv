@@ -147,31 +147,28 @@ class BlockManager:
                 self.dtype = torch.float32
 
         if self.quantization == "int8":
-            self.storage_dtype = torch.int8
+            self.storage_dtype, k_dt, v_dt, k_d, v_d, ks_d, vs_d = torch.int8, torch.int8, torch.int8, head_dim, head_dim, 1, 1
+        elif self.quantization == "k8v4":
+            self.storage_dtype, k_dt, v_dt, k_d, v_d = torch.int8, torch.int8, torch.uint8, head_dim, head_dim // 2
+            ks_d, vs_d = 1, KVQuantizer.num_int4_groups(head_dim, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
         elif self.quantization == "int4":
-            self.storage_dtype = torch.uint8
+            self.storage_dtype, k_dt, v_dt, k_d, v_d = torch.uint8, torch.uint8, torch.uint8, head_dim // 2, head_dim // 2
+            ks_d = KVQuantizer.num_int4_groups(head_dim, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+            vs_d = KVQuantizer.num_int4_groups(head_dim, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
         else:
-            self.storage_dtype = self.dtype
-
-        # Allocate physical memory pool
-        # For INT4, the last dimension is packed (head_dim // 2) bytes
-        pool_head_dim = head_dim // 2 if self.quantization == "int4" else head_dim
-        pool_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, pool_head_dim)
-
+            self.storage_dtype, k_dt, v_dt, k_d, v_d, ks_d, vs_d = self.dtype, self.dtype, self.dtype, head_dim, head_dim, 0, 0
+        k_sh = (max_num_blocks, num_layers, num_kv_heads, block_size, k_d)
+        v_sh = (max_num_blocks, num_layers, num_kv_heads, block_size, v_d)
         if self.device.type == "cpu" and self.pin_memory and torch.cuda.is_available():
-            self.k_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device="cpu").pin_memory()
-            self.v_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device="cpu").pin_memory()
+            self.k_pool = torch.zeros(k_sh, dtype=k_dt, device="cpu").pin_memory()
+            self.v_pool = torch.zeros(v_sh, dtype=v_dt, device="cpu").pin_memory()
         else:
-            self.k_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device=self.device)
-            self.v_pool = torch.zeros(pool_shape, dtype=self.storage_dtype, device=self.device)
-
-        # Quantization scale pools for INT8 and INT4
-        if self.quantization in ("int8", "int4"):
-            scale_last_dim = KVQuantizer.num_int4_groups(head_dim) if self.quantization == "int4" else 1
-            scale_shape = (max_num_blocks, num_layers, num_kv_heads, block_size, scale_last_dim)
-            scale_dtype = torch.float32 if self.device.type == "cpu" else torch.float16
-            self.k_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)
-            self.v_scale_pool = torch.ones(scale_shape, dtype=scale_dtype, device=self.device)
+            self.k_pool = torch.zeros(k_sh, dtype=k_dt, device=self.device)
+            self.v_pool = torch.zeros(v_sh, dtype=v_dt, device=self.device)
+        if self.quantization in ("int8", "k8v4", "int4"):
+            sdt = torch.float32 if self.device.type == "cpu" else torch.float16
+            self.k_scale_pool = torch.ones((max_num_blocks, num_layers, num_kv_heads, block_size, ks_d), dtype=sdt, device=self.device)
+            self.v_scale_pool = torch.ones((max_num_blocks, num_layers, num_kv_heads, block_size, vs_d), dtype=sdt, device=self.device)
         else:
             self.k_scale_pool = None
             self.v_scale_pool = None
@@ -293,9 +290,12 @@ class BlockManager:
         if self.quantization == "int8":
             k_storage, k_scale = KVQuantizer.quantize_int8(k_cache, dim=-1)
             v_storage, v_scale = KVQuantizer.quantize_int8(v_cache, dim=-1)
+        elif self.quantization == "k8v4":
+            k_storage, k_scale = KVQuantizer.quantize_int8(k_cache, dim=-1)
+            v_storage, v_scale = KVQuantizer.quantize_int4(v_cache, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
         elif self.quantization == "int4":
-            k_storage, k_scale = KVQuantizer.quantize_int4(k_cache, dim=-1)
-            v_storage, v_scale = KVQuantizer.quantize_int4(v_cache, dim=-1)
+            k_storage, k_scale = KVQuantizer.quantize_int4(k_cache, dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+            v_storage, v_scale = KVQuantizer.quantize_int4(v_cache, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
         else:
             k_storage = k_cache
             v_storage = v_cache
@@ -315,7 +315,7 @@ class BlockManager:
             self.k_pool[phys_id, :, :, :block_len, :] = k_storage[:, :, start:end, :]
             self.v_pool[phys_id, :, :, :block_len, :] = v_storage[:, :, start:end, :]
 
-            if self.quantization in ("int8", "int4") and k_scale is not None and v_scale is not None:
+            if self.quantization in ("int8", "k8v4", "int4") and k_scale is not None and v_scale is not None:
                 self.k_scale_pool[phys_id, :, :, :block_len, :] = k_scale[:, :, start:end, :]
                 self.v_scale_pool[phys_id, :, :, :block_len, :] = v_scale[:, :, start:end, :]
 
@@ -375,7 +375,7 @@ class BlockManager:
         self.k_pool[new_phys_id].copy_(self.k_pool[old_phys_id])
         self.v_pool[new_phys_id].copy_(self.v_pool[old_phys_id])
 
-        if self.quantization in ("int8", "int4") and self.k_scale_pool is not None:
+        if self.quantization in ("int8", "k8v4", "int4") and self.k_scale_pool is not None:
             self.k_scale_pool[new_phys_id].copy_(self.k_scale_pool[old_phys_id])
             self.v_scale_pool[new_phys_id].copy_(self.v_scale_pool[old_phys_id])
 

@@ -140,6 +140,7 @@ def triton_sparse_bridge_attention(
     base: float = 10000.0,
     block_start_tables: Optional[torch.Tensor] = None,
     valid_lens_tables: Optional[torch.Tensor] = None,
+    delta_bias: int = 32768,
 ) -> torch.Tensor:
     assert q_bridge.dtype == torch.float16, "sm_75 constraint: q_bridge must be float16"
     assert k_pool.dtype == torch.float16, "sm_75 constraint: k_pool must be float16"
@@ -163,7 +164,7 @@ def triton_sparse_bridge_attention(
         )
 
     cos_cache, sin_cache, delta_bias = get_cos_sin_cache(
-        head_dim=head_dim, base=base, max_delta=16384, device=q_bridge.device
+        head_dim=head_dim, base=base, max_delta=delta_bias, device=q_bridge.device
     )
 
     out_bridge = torch.empty_like(q_bridge)
