@@ -46,3 +46,4 @@ ENV/
 *.bbl
 *.blg
 *.synctex.gz
+benchmarks/pareto_results.json

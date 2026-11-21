@@ -2,8 +2,8 @@
 
 [![Hardware: NVIDIA | AMD ROCm | Apple Silicon MPS | CPU](https://img.shields.io/badge/Hardware-NVIDIA%20%7C%20AMD%20ROCm%20%7C%20Apple%20Silicon%20%7C%20CPU-76B900)](https://pytorch.org)
 [![Execution: Triton JIT + PyTorch Native Fallback](https://img.shields.io/badge/Kernels-Triton%20%2B%20PyTorch%20Fallback-orange)](dag_kv/kernels/)
-[![Tests: 65/65 Passed](https://img.shields.io/badge/Tests-65%2F65%20Passed-brightgreen)](tests/)
-[![Release: v0.3.0](https://img.shields.io/badge/Release-v0.3.0-blue)](pyproject.toml)
+[![Tests: 69 Tests](https://img.shields.io/badge/Tests-69%20Tests-brightgreen)](tests/)
+[![Release: v0.3.2](https://img.shields.io/badge/Release-v0.3.2-blue)](pyproject.toml)
 [![Paper: PDF](https://img.shields.io/badge/Paper-PDF-red?logo=adobeacrobatreader)](paper/dag_kv_paper.pdf)
 [![CI/CD: Multi-Arch Matrix](https://img.shields.io/badge/CI%2FCD-Ubuntu%20%7C%20macOS-blue?logo=githubactions)](.github/workflows/ci.yml)
 [![Docker: Multi-Arch amd64/arm64](https://img.shields.io/badge/Docker-Multi--Arch%20(amd64%2Farm64)-2496ED?logo=docker)](Dockerfile)
@@ -73,8 +73,21 @@ Ampere, Turing)
 * **CPU-Offloaded KV Pooling:** Keeps model weights on high-speed accelerator HBM while offloading massive shared canonical KV blocks to system RAM with pinned memory staging.
 
 ### 3. Adaptive Quantization & Memory Compression
-* **Runtime Quantization Selector:** Toggle on the fly between native floating point (`FP16`/`BF16`/`FP32`), **INT8 symmetric quantization** (cutting KV VRAM by 50%), and **INT4 packed quantization** (cutting KV VRAM by 75%).
+* **Runtime Quantization Selector:** Switch between native floating point (`none`), **INT8** (`1.97x`), **K8V4** (`2.53x`, INT8 Keys + Group-32 INT4 Values — outlier-safe default for Qwen2.5 and Llama-3.2), and **INT4** (`3.05x`, decoupled `K=g8 / V=g32` symmetric quantization), all backed by fused Triton SRAM decode/bridge kernels and native PyTorch fallbacks.
 * **Configurable Block Sizes:** Dynamic block sizes (`BLOCK_SIZE = 8, 16, 32, 64`) to balance fragmentation vs. memory efficiency for small contexts or massive codebases.
+
+#### Real-Weight Quantization Pareto Benchmark (RTX 2080 Ti, `v0.3.2`)
+
+| Model | Quant | KV Pool (8K slots) | Compression | Stitch+Repair | Decode (ms/tok) | Throughput | Multi-Chunk EM | Top-1 vs HF | Mean KL |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Qwen2.5-3B-Instruct | FP16 | 288.0 MiB | 1.00x | 39.8 ms | 29.5 ms | 33.9 tok/s | 6/6 (100%) | 100% | 0.0308 |
+| Qwen2.5-3B-Instruct | INT8 | 146.2 MiB | 1.97x | 49.0 ms | 38.4 ms | 26.0 tok/s | 6/6 (100%) | 100% | 0.0429 |
+| Qwen2.5-3B-Instruct | **K8V4 (g32)** | **113.6 MiB** | **2.53x** | 50.5 ms | 41.6 ms | 24.0 tok/s | **6/6 (100%)** | **100%** | **0.0515** |
+| Qwen2.5-3B-Instruct | **INT4 (K8g/V32g)** | **94.5 MiB** | **3.05x** | 52.8 ms | 44.0 ms | 22.7 tok/s | **6/6 (100%)** | 67% | 0.8961 |
+| Llama-3.2-3B-Instruct | FP16 | 896.0 MiB | 1.00x | 31.2 ms | 29.1 ms | 34.3 tok/s | 5/6 (83%) | 83% | 0.2052 |
+| Llama-3.2-3B-Instruct | INT8 | 455.0 MiB | 1.97x | 117.3 ms | 39.6 ms | 25.2 tok/s | 6/6 (100%) | 83% | 0.2030 |
+| Llama-3.2-3B-Instruct | **K8V4 (g32)** | **353.5 MiB** | **2.53x** | 133.8 ms | 42.9 ms | 23.3 tok/s | **6/6 (100%)** | 83% | **0.2090** |
+| Llama-3.2-3B-Instruct | **INT4 (K8g/V32g)** | **294.0 MiB** | **3.05x** | 158.8 ms | 45.6 ms | 21.9 tok/s | **6/6 (100%)** | 83% | **0.2027** |
 
 ---
 
