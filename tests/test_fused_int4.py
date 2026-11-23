@@ -107,3 +107,48 @@ def test_fused_quant_triton_vs_pytorch_parity(mode):
     br_pt = pytorch_sparse_bridge_attention(qb.float(), bpos, kp, vp, bt, ot, base=1e6, block_start_tables=bs, valid_lens_tables=vl, k_scales=ks.float(), v_scales=vs.float()).to(torch.float16)
     cos_br = F.cosine_similarity(br_pt.flatten().float(), br_tr.flatten().float(), dim=0).item()
     assert cos_br > 0.999, f"[{mode}] bridge parity failed: cos={cos_br}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not is_triton_available(), reason="CUDA + Triton required")
+@pytest.mark.parametrize("mode", ["int8", "k8v4", "int4"])
+def test_fused_kv_quant_write_parity(mode):
+    from dag_kv.kernels.dispatch import fused_kv_quant_write
+
+    torch.manual_seed(7)
+    dev = torch.device("cuda:0")
+    bm = BlockManager(1, 4, 128, max_num_blocks=8, block_size=16, device=dev, quantization=mode)
+    k_in = torch.randn(3, 4, 128, dtype=torch.float16, device=dev)
+    v_in = torch.randn(3, 4, 128, dtype=torch.float16, device=dev)
+    phys = torch.tensor([1, 4, 6], dtype=torch.long, device=dev)
+    slots = torch.tensor([2, 9, 15], dtype=torch.long, device=dev)
+
+    fused_kv_quant_write(
+        k_in, v_in, bm.k_pool[:, 0], bm.v_pool[:, 0],
+        bm.k_scale_pool[:, 0], bm.v_scale_pool[:, 0], phys, slots, mode,
+    )
+    k_ref_q, k_ref_s = (
+        KVQuantizer.quantize_int4(k_in, dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+        if mode == "int4" else KVQuantizer.quantize_int8(k_in, dim=-1)
+    )
+    v_ref_q, v_ref_s = (
+        KVQuantizer.quantize_int4(v_in, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+        if mode in ("k8v4", "int4") else KVQuantizer.quantize_int8(v_in, dim=-1)
+    )
+    k_tr = (
+        KVQuantizer.dequantize_int4(bm.k_pool[phys, 0, :, slots, :], bm.k_scale_pool[phys, 0, :, slots, :], torch.float32)
+        if mode == "int4" else bm.k_pool[phys, 0, :, slots, :].float() * bm.k_scale_pool[phys, 0, :, slots, :].float()
+    )
+    k_pt = (
+        KVQuantizer.dequantize_int4(k_ref_q, k_ref_s, torch.float32)
+        if mode == "int4" else k_ref_q.float() * k_ref_s.float()
+    )
+    v_tr = (
+        KVQuantizer.dequantize_int4(bm.v_pool[phys, 0, :, slots, :], bm.v_scale_pool[phys, 0, :, slots, :], torch.float32)
+        if mode in ("k8v4", "int4") else bm.v_pool[phys, 0, :, slots, :].float() * bm.v_scale_pool[phys, 0, :, slots, :].float()
+    )
+    v_pt = (
+        KVQuantizer.dequantize_int4(v_ref_q, v_ref_s, torch.float32)
+        if mode in ("k8v4", "int4") else v_ref_q.float() * v_ref_s.float()
+    )
+    assert F.cosine_similarity(k_tr.flatten(), k_pt.flatten(), dim=0).item() > 0.9999
+    assert F.cosine_similarity(v_tr.flatten(), v_pt.flatten(), dim=0).item() > 0.9999

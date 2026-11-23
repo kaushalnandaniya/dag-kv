@@ -2,8 +2,8 @@
 
 [![Hardware: NVIDIA | AMD ROCm | Apple Silicon MPS | CPU](https://img.shields.io/badge/Hardware-NVIDIA%20%7C%20AMD%20ROCm%20%7C%20Apple%20Silicon%20%7C%20CPU-76B900)](https://pytorch.org)
 [![Execution: Triton JIT + PyTorch Native Fallback](https://img.shields.io/badge/Kernels-Triton%20%2B%20PyTorch%20Fallback-orange)](dag_kv/kernels/)
-[![Tests: 69 Tests](https://img.shields.io/badge/Tests-69%20Tests-brightgreen)](tests/)
-[![Release: v0.3.2](https://img.shields.io/badge/Release-v0.3.2-blue)](pyproject.toml)
+[![Tests: 72 Tests](https://img.shields.io/badge/Tests-72%20Tests-brightgreen)](tests/)
+[![Release: v0.3.3](https://img.shields.io/badge/Release-v0.3.3-blue)](pyproject.toml)
 [![Paper: PDF](https://img.shields.io/badge/Paper-PDF-red?logo=adobeacrobatreader)](paper/dag_kv_paper.pdf)
 [![CI/CD: Multi-Arch Matrix](https://img.shields.io/badge/CI%2FCD-Ubuntu%20%7C%20macOS-blue?logo=githubactions)](.github/workflows/ci.yml)
 [![Docker: Multi-Arch amd64/arm64](https://img.shields.io/badge/Docker-Multi--Arch%20(amd64%2Farm64)-2496ED?logo=docker)](Dockerfile)
@@ -88,6 +88,19 @@ Ampere, Turing)
 | Llama-3.2-3B-Instruct | INT8 | 455.0 MiB | 1.97x | 117.3 ms | 39.6 ms | 25.2 tok/s | 6/6 (100%) | 83% | 0.2030 |
 | Llama-3.2-3B-Instruct | **K8V4 (g32)** | **353.5 MiB** | **2.53x** | 133.8 ms | 42.9 ms | 23.3 tok/s | **6/6 (100%)** | 83% | **0.2090** |
 | Llama-3.2-3B-Instruct | **INT4 (K8g/V32g)** | **294.0 MiB** | **3.05x** | 158.8 ms | 45.6 ms | 21.9 tok/s | **6/6 (100%)** | 83% | **0.2027** |
+
+#### Fused Triton KV-Write + Decode Attention Crossover (`v0.3.3`, 28 Layers, RTX 2080 Ti)
+
+Fusing quantization, nibble packing, and paged scatter into a single Triton launch (`triton_fused_kv_quant_write`) cuts 28-layer KV write latency from `6.4–11.9 ms` to `1.44–1.95 ms`, letting quantized tiers beat FP16 in both memory and latency from 2K tokens onward:
+
+| Context Length | FP16 (`1.00x`) | INT8 (`1.97x`) | K8V4 (`2.53x`) | INT4 (`3.05x`) | Peak Speedup vs. FP16 |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 5.23 ms | 4.92 ms | 4.90 ms | **4.60 ms** | 1.14x (`INT4`) |
+| 1,024 | **4.51 ms** | 4.87 ms | 4.93 ms | 4.66 ms | 0.97x (`INT4`) |
+| 2,048 | 9.67 ms | 8.88 ms | 8.40 ms | **7.30 ms** | **1.32x** (`INT4`) |
+| 4,096 | 18.89 ms | 19.42 ms | 19.36 ms | **14.38 ms** | **1.31x** (`INT4`) |
+| 8,192 | 37.34 ms | 35.17 ms | **29.34 ms** | **23.64 ms** | **1.58x** (`INT4`) / **1.27x** (`K8V4`) |
+
 
 ---
 

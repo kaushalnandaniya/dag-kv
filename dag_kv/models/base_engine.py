@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 import math
 from typing import Dict, List, Optional, Tuple, Union
 import torch
+from dag_kv.kernels.dispatch import fused_kv_quant_write
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from dag_kv.core.block_manager import BlockManager, OffsetBlockTable
@@ -517,36 +518,15 @@ class DAGKVEngine(ABC):
             q_rot = (q * cos_q) + (rotate_half(q) * sin_q)
             k_rot = (k * cos_k) + (rotate_half(k) * sin_k)
 
-            if self.block_manager.quantization == "int8":
-                from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int8(k_rot.transpose(0, 1), dim=-1)
-                vq, vsc = KVQuantizer.quantize_int8(v.transpose(0, 1), dim=-1)
-                self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = kq
-                self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vq
-                self.block_manager.k_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = ksc
-                self.block_manager.v_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vsc
+            if self.block_manager.quantization in ("int8", "k8v4", "int4"):
                 k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
                 v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
-            elif self.block_manager.quantization == "k8v4":
-                from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int8(k_rot.transpose(0, 1), dim=-1)
-                vq, vsc = KVQuantizer.quantize_int4(v.transpose(0, 1), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
-                self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = kq
-                self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vq
-                self.block_manager.k_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = ksc
-                self.block_manager.v_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vsc
-                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
-                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
-            elif self.block_manager.quantization == "int4":
-                from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int4(k_rot.transpose(0, 1), dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
-                vq, vsc = KVQuantizer.quantize_int4(v.transpose(0, 1), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
-                self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = kq
-                self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vq
-                self.block_manager.k_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = ksc
-                self.block_manager.v_scale_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = vsc
-                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
-                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
+                fused_kv_quant_write(
+                    k_rot.transpose(0, 1), v.transpose(0, 1),
+                    self.block_manager.k_pool[:, l_idx], self.block_manager.v_pool[:, l_idx],
+                    k_scales_l, v_scales_l,
+                    bridge_phys_ids, bridge_slot_offs, self.block_manager.quantization,
+                )
             else:
                 self.block_manager.k_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = k_rot.transpose(0, 1)
                 self.block_manager.v_pool[bridge_phys_ids, l_idx, :, bridge_slot_offs, :] = v.transpose(0, 1)
@@ -642,36 +622,15 @@ class DAGKVEngine(ABC):
             q_rot = (q * cos) + (rotate_half(q) * sin)
             k_rot = (k * cos) + (rotate_half(k) * sin)
 
-            if self.block_manager.quantization == "int8":
-                from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int8(k_rot.squeeze(2), dim=-1)
-                vq, vsc = KVQuantizer.quantize_int8(v.squeeze(2), dim=-1)
-                self.block_manager.k_pool[phys_t, l_idx, :, slots_t, :] = kq
-                self.block_manager.v_pool[phys_t, l_idx, :, slots_t, :] = vq
-                self.block_manager.k_scale_pool[phys_t, l_idx, :, slots_t, :] = ksc
-                self.block_manager.v_scale_pool[phys_t, l_idx, :, slots_t, :] = vsc
+            if self.block_manager.quantization in ("int8", "k8v4", "int4"):
                 k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
                 v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
-            elif self.block_manager.quantization == "k8v4":
-                from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int8(k_rot.squeeze(2), dim=-1)
-                vq, vsc = KVQuantizer.quantize_int4(v.squeeze(2), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
-                self.block_manager.k_pool[phys_t, l_idx, :, slots_t, :] = kq
-                self.block_manager.v_pool[phys_t, l_idx, :, slots_t, :] = vq
-                self.block_manager.k_scale_pool[phys_t, l_idx, :, slots_t, :] = ksc
-                self.block_manager.v_scale_pool[phys_t, l_idx, :, slots_t, :] = vsc
-                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
-                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
-            elif self.block_manager.quantization == "int4":
-                from dag_kv.core.quantizer import KVQuantizer
-                kq, ksc = KVQuantizer.quantize_int4(k_rot.squeeze(2), dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
-                vq, vsc = KVQuantizer.quantize_int4(v.squeeze(2), dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
-                self.block_manager.k_pool[phys_t, l_idx, :, slots_t, :] = kq
-                self.block_manager.v_pool[phys_t, l_idx, :, slots_t, :] = vq
-                self.block_manager.k_scale_pool[phys_t, l_idx, :, slots_t, :] = ksc
-                self.block_manager.v_scale_pool[phys_t, l_idx, :, slots_t, :] = vsc
-                k_scales_l = self.block_manager.k_scale_pool[:, l_idx]
-                v_scales_l = self.block_manager.v_scale_pool[:, l_idx]
+                fused_kv_quant_write(
+                    k_rot.squeeze(2), v.squeeze(2),
+                    self.block_manager.k_pool[:, l_idx], self.block_manager.v_pool[:, l_idx],
+                    k_scales_l, v_scales_l,
+                    phys_t, slots_t, self.block_manager.quantization,
+                )
             else:
                 self.block_manager.k_pool[phys_t, l_idx, :, slots_t, :] = k_rot.squeeze(2)
                 self.block_manager.v_pool[phys_t, l_idx, :, slots_t, :] = v.squeeze(2)

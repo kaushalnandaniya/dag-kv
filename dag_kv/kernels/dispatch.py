@@ -6,6 +6,7 @@ and pure PyTorch native fallbacks (Apple Silicon MPS, CPU, and Quantized pools).
 
 from typing import Optional
 import torch
+from dag_kv.core.quantizer import KVQuantizer
 
 from .pytorch_fallbacks import pytorch_adjoint_paged_attention, pytorch_sparse_bridge_attention
 
@@ -19,6 +20,7 @@ try:
         triton_adjoint_paged_attention_int4,
     )
     from .triton_k8v4_paged_attn import triton_adjoint_paged_attention_k8v4
+    from .triton_kv_write import triton_fused_kv_quant_write
     from .triton_sparse_stitch import triton_sparse_bridge_attention
     _HAS_TRITON = True
 except (ImportError, Exception):
@@ -286,3 +288,32 @@ def sparse_bridge_attention(
         v_scales=v_scales,
         delta_bias=delta_bias,
     )
+
+
+def fused_kv_quant_write(
+    k_in: torch.Tensor, v_in: torch.Tensor,
+    k_pool_l: torch.Tensor, v_pool_l: torch.Tensor,
+    k_scale_l: torch.Tensor, v_scale_l: torch.Tensor,
+    phys_ids: torch.Tensor, slot_offs: torch.Tensor,
+    quantization: str,
+) -> None:
+    """Fused quantize + pack + scatter write (Triton on CUDA, PyTorch fallback on CPU/MPS)."""
+    if _HAS_TRITON and k_in.is_cuda and k_pool_l.is_cuda:
+        triton_fused_kv_quant_write(
+            k_in, v_in, k_pool_l, v_pool_l, k_scale_l, v_scale_l, phys_ids, slot_offs,
+            k_group_size=KVQuantizer.INT4_K_GROUP_SIZE, v_group_size=KVQuantizer.INT4_V_GROUP_SIZE,
+        )
+        return
+    if quantization == "int8":
+        kq, ksc = KVQuantizer.quantize_int8(k_in, dim=-1)
+        vq, vsc = KVQuantizer.quantize_int8(v_in, dim=-1)
+    elif quantization == "k8v4":
+        kq, ksc = KVQuantizer.quantize_int8(k_in, dim=-1)
+        vq, vsc = KVQuantizer.quantize_int4(v_in, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+    else:
+        kq, ksc = KVQuantizer.quantize_int4(k_in, dim=-1, group_size=KVQuantizer.INT4_K_GROUP_SIZE)
+        vq, vsc = KVQuantizer.quantize_int4(v_in, dim=-1, group_size=KVQuantizer.INT4_V_GROUP_SIZE)
+    k_pool_l[phys_ids, :, slot_offs, :] = kq
+    v_pool_l[phys_ids, :, slot_offs, :] = vq
+    k_scale_l[phys_ids, :, slot_offs, :] = ksc
+    v_scale_l[phys_ids, :, slot_offs, :] = vsc
