@@ -152,3 +152,39 @@ def test_fused_kv_quant_write_parity(mode):
     )
     assert F.cosine_similarity(k_tr.flatten(), k_pt.flatten(), dim=0).item() > 0.9999
     assert F.cosine_similarity(v_tr.flatten(), v_pt.flatten(), dim=0).item() > 0.9999
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not is_triton_available(), reason="CUDA + Triton required")
+def test_int64_block_offset_beyond_2gb():
+    """Regression test: physical block offsets exceeding INT32_MAX (2^31 - 1) must not overflow."""
+    dev = torch.device("cuda:0")
+    free_bytes, _ = torch.cuda.mem_get_info(dev)
+    if free_bytes < int(3.5 * 1024**3):
+        pytest.skip("Requires >=3.5 GiB free VRAM to allocate >2^31 element KV pool")
+
+    # stride(0) = 1 * 8 * 16 * 128 = 16,384; allocate 135,000 blocks -> max offset = 2,211,823,616 > 2^31
+    num_blocks = 135_000
+    k_pool = torch.zeros((num_blocks, 8, 16, 128), dtype=torch.int8, device=dev)
+    v_pool = torch.zeros((num_blocks, 8, 16, 64), dtype=torch.uint8, device=dev)
+    k_scales = torch.ones((num_blocks, 8, 16, 1), dtype=torch.float16, device=dev)
+    v_scales = torch.ones((num_blocks, 8, 16, 4), dtype=torch.float16, device=dev)
+    assert (num_blocks - 1) * k_pool.stride(0) > (1 << 31) - 1
+
+    last_blk = num_blocks - 1
+    k_pool[last_blk].fill_(32)
+    v_pool[last_blk].fill_(0x99)  # nibble 9 -> signed +1
+    q = torch.ones((1, 8, 1, 128), dtype=torch.float16, device=dev)
+    bt = torch.tensor([[last_blk]], dtype=torch.int32, device=dev)
+    ot = torch.zeros_like(bt)
+    bs = torch.zeros_like(bt)
+    vl = torch.tensor([[16]], dtype=torch.int32, device=dev)
+    sl = torch.tensor([16], dtype=torch.int32, device=dev)
+
+    out = adjoint_paged_attention(
+        q, k_pool, v_pool, bt, ot, sl,
+        block_start_tables=bs, valid_lens_tables=vl,
+        k_scales=k_scales, v_scales=v_scales,
+    )
+    torch.cuda.synchronize()
+    assert not torch.isnan(out).any()
+    assert torch.allclose(out.float(), torch.ones_like(out.float()), atol=1e-2)

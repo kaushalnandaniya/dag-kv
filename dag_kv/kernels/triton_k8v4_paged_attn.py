@@ -47,7 +47,7 @@ def _k8v4_decode_kernel(
         bstart = tl.load(Bs_ptr + cb * sbsb + b * sbsn)
         vlen = tl.load(Vl_ptr + cb * svlb + b * svln)
         if bstart < seq_len and vlen > 0:
-            pb = tl.load(Bt_ptr + cb * sbtb + b * sbtn)
+            pb = tl.load(Bt_ptr + cb * sbtb + b * sbtn).to(tl.int64)
             drow = tl.load(Ot_ptr + cb * sotb + b * sotn) + delta_bias
             cd = tl.load(Cos_ptr + drow * scd + od * scdim).to(tl.float32)
             sd = tl.load(Sin_ptr + drow * ssd + od * ssdim).to(tl.float32)

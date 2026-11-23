@@ -70,7 +70,7 @@ def _triton_sparse_bridge_micro_prefill_kernel(
         blk_start = tl.load(Block_start_ptr + cur_batch * stride_bsb + b * stride_bsn)
         valid_len = tl.load(Valid_lens_ptr + cur_batch * stride_vlb + b * stride_vln)
         if blk_start < causal_limit and valid_len > 0:
-            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn)
+            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn).to(tl.int64)
             delta = tl.load(Offset_table_ptr + cur_batch * stride_otb + b * stride_otn)
 
             delta_row = delta + delta_bias

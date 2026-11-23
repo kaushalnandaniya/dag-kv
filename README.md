@@ -2,8 +2,8 @@
 
 [![Hardware: NVIDIA | AMD ROCm | Apple Silicon MPS | CPU](https://img.shields.io/badge/Hardware-NVIDIA%20%7C%20AMD%20ROCm%20%7C%20Apple%20Silicon%20%7C%20CPU-76B900)](https://pytorch.org)
 [![Execution: Triton JIT + PyTorch Native Fallback](https://img.shields.io/badge/Kernels-Triton%20%2B%20PyTorch%20Fallback-orange)](dag_kv/kernels/)
-[![Tests: 72 Tests](https://img.shields.io/badge/Tests-72%20Tests-brightgreen)](tests/)
-[![Release: v0.3.3](https://img.shields.io/badge/Release-v0.3.3-blue)](pyproject.toml)
+[![Tests: 73 Tests](https://img.shields.io/badge/Tests-73%20Tests-brightgreen)](tests/)
+[![Release: v0.3.4](https://img.shields.io/badge/Release-v0.3.4-blue)](pyproject.toml)
 [![Paper: PDF](https://img.shields.io/badge/Paper-PDF-red?logo=adobeacrobatreader)](paper/dag_kv_paper.pdf)
 [![CI/CD: Multi-Arch Matrix](https://img.shields.io/badge/CI%2FCD-Ubuntu%20%7C%20macOS-blue?logo=githubactions)](.github/workflows/ci.yml)
 [![Docker: Multi-Arch amd64/arm64](https://img.shields.io/badge/Docker-Multi--Arch%20(amd64%2Farm64)-2496ED?logo=docker)](Dockerfile)
@@ -100,6 +100,22 @@ Fusing quantization, nibble packing, and paged scatter into a single Triton laun
 | 2,048 | 9.67 ms | 8.88 ms | 8.40 ms | **7.30 ms** | **1.32x** (`INT4`) |
 | 4,096 | 18.89 ms | 19.42 ms | 19.36 ms | **14.38 ms** | **1.31x** (`INT4`) |
 | 8,192 | 37.34 ms | 35.17 ms | **29.34 ms** | **23.64 ms** | **1.58x** (`INT4`) / **1.27x** (`K8V4`) |
+
+#### Batched Concurrency & VRAM Ceiling (`v0.3.4`, 28 Layers, RTX 2080 Ti with 6.0 GiB Reserved for 3B FP16 Weights)
+
+With 64-bit physical block indexing across all Triton kernels, quantized KV pools scale cleanly past 2 GiB—delivering up to **3.5x higher concurrency** and **1.98x higher peak KV+Attention throughput** before physical OOM:
+
+| Context | Mode | Max Batch | Concurrency | KV Pool | `B=1` Step | Peak KV+Attn tok/s | vs. FP16 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 4,096 | FP16 (`none`) | 8 | 1.00x | 3,584 MiB | 18.87 ms | 230.9 tok/s | 1.00x |
+| 4,096 | INT8 | 20 | 2.50x | 4,550 MiB | 14.68 ms | 199.7 tok/s | 0.86x |
+| 4,096 | **K8V4 (g32)** | **24** | **3.00x** | 4,242 MiB | 14.87 ms | **400.7 tok/s** | **1.74x** |
+| 4,096 | **INT4 (K8g/V32g)** | **28** | **3.50x** | 4,116 MiB | **12.03 ms** | 370.0 tok/s | **1.60x** |
+| 8,192 | FP16 (`none`) | 4 | 1.00x | 3,584 MiB | 28.96 ms | 90.7 tok/s | 1.00x |
+| 8,192 | INT8 | 8 | 2.00x | 3,640 MiB | 29.46 ms | 100.5 tok/s | 1.11x |
+| 8,192 | **K8V4 (g32)** | **12** | **3.00x** | 4,242 MiB | 29.77 ms | **179.2 tok/s** | **1.98x** |
+| 8,192 | **INT4 (K8g/V32g)** | **12** | **3.00x** | 3,528 MiB | **24.30 ms** | 156.8 tok/s | **1.73x** |
+
 
 
 ---

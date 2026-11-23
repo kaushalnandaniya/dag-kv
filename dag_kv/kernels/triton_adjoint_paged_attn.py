@@ -64,7 +64,7 @@ def _triton_adjoint_paged_attn_decode_kernel(
         blk_start = tl.load(Block_start_ptr + cur_batch * stride_bsb + b * stride_bsn)
         valid_len = tl.load(Valid_lens_ptr + cur_batch * stride_vlb + b * stride_vln)
         if blk_start < seq_len and valid_len > 0:
-            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn)
+            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn).to(tl.int64)
             delta = tl.load(Offset_table_ptr + cur_batch * stride_otb + b * stride_otn)
 
             delta_row = delta + delta_bias
@@ -345,7 +345,7 @@ def _triton_adjoint_paged_attn_int4_decode_kernel(
         blk_start = tl.load(Block_start_ptr + cur_batch * stride_bsb + b * stride_bsn)
         valid_len = tl.load(Valid_lens_ptr + cur_batch * stride_vlb + b * stride_vln)
         if blk_start < seq_len and valid_len > 0:
-            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn)
+            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn).to(tl.int64)
             delta = tl.load(Offset_table_ptr + cur_batch * stride_otb + b * stride_otn)
 
             delta_row = delta + delta_bias
@@ -583,7 +583,7 @@ def _triton_adjoint_paged_attn_int8_decode_kernel(
         blk_start = tl.load(Block_start_ptr + cur_batch * stride_bsb + b * stride_bsn)
         valid_len = tl.load(Valid_lens_ptr + cur_batch * stride_vlb + b * stride_vln)
         if blk_start < seq_len and valid_len > 0:
-            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn)
+            phys_block = tl.load(Block_table_ptr + cur_batch * stride_btb + b * stride_btn).to(tl.int64)
             delta = tl.load(Offset_table_ptr + cur_batch * stride_otb + b * stride_otn)
 
             delta_row = delta + delta_bias
